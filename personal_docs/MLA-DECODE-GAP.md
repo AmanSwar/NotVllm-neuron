@@ -17,6 +17,15 @@ what source could not settle.
 
 ---
 
+> **Update 2026-09-25 — the spike ran, at a cheaper tier than this document planned.**
+> `q_head = 64` at `d_head = 512` **validates**, as predicted, at `s_active` 1 and 2 and
+> across `bs` 1-64; DeepSeek's 576 is rejected with exactly the predicted assert.
+> `kernel_assert` is a plain Python assert, so the whole §6.3 table is reachable by
+> calling `_compute_tile_params` directly — no simulator, no compile, no device. Full
+> result, including two predictions of mine that were wrong, in
+> `dev/progress/2026-09-25-mla-decode-spike-prediction.md`. §6.2's QK-swap paragraph is
+> corrected in place. Numerics (tier 1) remain unrun.
+
 ## 0. Verdict
 
 1. **GLM-5.3-Flash's MLA fits inside an existing decode kernel's supported range, and
@@ -398,12 +407,23 @@ means `fuse_rope=False`, so it cannot fire. **I expect `q_head=64` to work.** If
 does not, the failure is in SBUF pressure or the qk-swap layout, not in an explicit
 limit — which is a different and more interesting answer than an assert.
 
-One threshold to watch rather than fear: the QK-swap fast path does not support
-`s_active_qh > p_max` (`:1273`, "Q-tiling ... not yet supported"), so `s_active *
-q_head > 128` disengages it via `is_qk_swapped`. At `s_active=1, q_head=64` that is 64
-(engaged); with one MTP draft, 128 (still engaged); at two drafts, 192 (disengages and
-falls back — slower, not broken). `NKILIB_EXPERIMENTAL_ATTN_TKG_NO_SWAP=1` forces it
-off, which is the knob for isolating a swap-path failure.
+**Corrected 2026-09-25 by the tier-0 run — this paragraph was wrong.** I had written
+that the QK-swap fast path engages at `s_active_qh ≤ 128` and disengages above it, making
+the threshold something to watch. It engages *never*, for two reasons neither of which is
+`s_active_qh`:
+
+- The **installed** nkilib (neuronx-cc 2.27.5334.0) disables it unconditionally —
+  `attention_tkg_utils.py:356-358`: `# Disable due to sometimes causing OOB errors.`
+  `# TODO: remove this gate.` `return False`. Everything below is dead code, for every
+  model, not just MLA.
+- That gate is **gone** in the newer source checkout (`92d11f6`), but
+  `if d_head > p_max: return False` (*"d_head tiling not yet supported"*) still excludes
+  `d_head = 512` there. Present in both versions.
+
+So the swap path is not a knob for MLA, and `NKILIB_EXPERIMENTAL_ATTN_TKG_NO_SWAP=1` is
+pointless here. Combined with `use_dma_transpose=False` (confirmed empirically), **both
+KV fast paths are off at `d_head=512`** — functional on the slow route on two independent
+axes. That is the shape of the performance risk, and it is unquantified.
 
 ### 6.3 The asserts to watch, and what each one means
 

@@ -219,31 +219,55 @@ From PR #40's write-up, all real and none of it model math:
 
 ## 4. Kernels: less work than assumed
 
-`nkilib` is `pip install nki-library`, Apache-2.0, full source at
+`nkilib` is Apache-2.0, full source at
 [aws-neuron/nki-library](https://github.com/aws-neuron/nki-library). It ships
-bundled inside `neuronx-cc` and the pip package replaces it.
+bundled inside `neuronx-cc`. **There is no separate `nki-library` pip package** —
+`https://pip.repos.neuron.amazonaws.com/nki-library/` returns 404 (checked
+2026-09-25), so whatever `neuronx-cc` bundles is what you get.
 
-Most "missing ops" for our target models **already exist** in
-`nkilib/experimental/`:
+> **Correction, 2026-09-25.** The table below was built from a *source checkout*
+> of nki-library. It does **not** describe the installed package. Verified
+> against the `nkilib` bundled with `neuronx-cc 2.27.5334.0` — version
+> `0.0.0.0dev0+3b542be2`, built Jul 15 2026 — on the dev box:
+>
+> `experimental/` contains: `attention`, `attention_mxfp8`, `benchmark`,
+> `collectives`, `conv`, `deformable_attention`, `dynamic_shapes`, `foreach`,
+> `loss`, `matmul_mxfp8`, `misc`, `mla`, `mlp_mxfp8`, `moe`, `moe_block`,
+> `moe_mxfp8`, `mxfp_subkernels`, `mxfp_utils`.
+>
+> **Absent: `gdn/`, `sparse_attention_indexer/`, `deepseekv32_mlp/`, `scan/`,
+> `transformer/`.** `gdn` does not appear anywhere in the installed tree.
+> Found by dev2; independently confirmed here.
 
-| Directory | Contents | Relevant to |
-|---|---|---|
-| `gdn/` | `gdn_tkg.py`, **`gdn_cte.py`**, `gdn_conv1d.py`, `gdn_block_tkg.py`, + `_torch` refs | Qwen3.8-27B; base for GLM-5.3-Flash KDA |
-| `mla/deepseek/` | `mla_qkv_cte`, `mla_sparse_attention_cte`, `mla_vup_oproj_cte` — **prefill only** | GLM-5.3, DeepSeek-V4.1 |
-| `sparse_attention_indexer/` | DeepSeek sparse-attention indexer, top-k | GLM-5.3 DSA |
-| `deepseekv32_mlp/`, `moe_block/`, `moe_mxfp8/` | MoE + EP + MXFP8 | all MoE targets |
-| `scan/` | linear scan, selective scan (Mamba), SSD (Mamba-2) | linear-attention fallbacks |
-| `attention/`, `attention_mxfp8/`, `transformer/` | flash CTE/TKG, SWA fused, megakernels | everything |
+| Directory | Contents | Relevant to | Installed? |
+|---|---|---|---|
+| `gdn/` | `gdn_tkg.py`, `gdn_cte.py`, `gdn_conv1d.py`, `gdn_block_tkg.py`, + `_torch` refs | Qwen3.8-27B; base for GLM-5.3-Flash KDA | **NO** |
+| `mla/deepseek/` | `mla_qkv_cte`, `mla_sparse_attention_cte`, `mla_vup_oproj_cte`, `mla_common_cte`, + `_torch` refs — **prefill only** | GLM-5.3, DeepSeek-V4.1 | yes |
+| `sparse_attention_indexer/` | DeepSeek sparse-attention indexer, top-k | GLM-5.3 DSA | **NO** |
+| `moe_block/`, `moe_mxfp8/`, `moe/` | MoE + EP + MXFP8 | all MoE targets | yes |
+| `deepseekv32_mlp/` | DeepSeek V3.2 MLP | MoE targets | **NO** |
+| `scan/` | linear scan, selective scan (Mamba), SSD (Mamba-2) | linear-attention fallbacks | **NO** |
+| `attention/`, `attention_mxfp8/` | flash CTE/TKG, SWA fused | everything | yes |
+| `transformer/` | megakernels | everything | **NO** |
 
-Note `gdn_cte.py` — the chunked DeltaNet **prefill** kernel. Earlier NxDI work
-assumed this had to be written; it did not.
+The `mla/deepseek/` listing **confirms §3.4 against the shipped package**: every
+file is `*_cte`, plus `mla_validate_params.py`. There is no decode kernel in the
+installed nkilib either, not just in the checkout.
 
-Every kernel has a `*_torch.py` reference implementation next to it, which is what
-makes CPU-mode validation possible.
+Every kernel does have a `*_torch.py` reference next to it, which is what makes
+CPU-mode validation possible — for the kernels that ship.
 
-**Revised view: kernel authoring is roughly 10–20% of a port.** The dominant costs
-are model-level integration (weight mapping, sharding, cache plumbing) and
-fighting the compiler.
+**Revised view, twice over.** Kernel *authoring* may still be 10–20% of a port,
+but the kernels this roadmap leans on hardest — `gdn` for Qwen3.8-27B and as the
+base for GLM-5.3-Flash's KDA, and `sparse_attention_indexer` for GLM-5.3's DSA —
+**are not in the shipped library**. They exist in the GitHub source, so the work
+is vendoring rather than writing, with
+`functional/vendored_kernels/rotational_topk/` as the in-tree precedent. But that
+adds a provenance and version-skew problem that "they already exist" concealed:
+the vendored copy and the bundled `nkilib` will drift, and nothing checks it.
+
+Before relying on any `nkilib/experimental/` module, **check it is installed**.
+For these the question is absence, not version skew.
 
 ### How kernels are wired
 

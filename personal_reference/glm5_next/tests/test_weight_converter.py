@@ -136,8 +136,7 @@ def test_synthetic_index_reproduces_real_totals(wm):
 
 # ------------------------------------------------- the seven carried invariants
 def test_vision_and_mtp_dropped(plan):
-    assert all(".visual." in k or f".layers.{WC.MTP_LAYER}." in k or ".indexer." in k
-               for k in plan.dropped)
+    assert all(".visual." in k or f".layers.{WC.MTP_LAYER}." in k for k in plan.dropped)
     assert any(".visual." in k for k in plan.dropped)
     assert any(f".layers.{WC.MTP_LAYER}." in k for k in plan.dropped)
     assert plan.dropped[f"{PREFIX}layers.45.enorm.weight"] == WC.DROP_MTP
@@ -246,15 +245,21 @@ def test_kda_attention_is_entirely_bf16(plan):
             assert f"{PREFIX}layers.{li}.{kind}" not in plan.scales
 
 
-def test_indexer_and_hc_are_bf16_and_indexer_is_dropped(plan):
+def test_indexer_and_hc_are_bf16_and_indexer_is_mapped(plan):
+    """The oracle runs the real DSA indexer, so its 7 tensors x 11 layers are loaded
+    under their own names; before it did, they were dropped."""
+    n = 0
     for li in MLA_LAYERS:
         for kind in MLA_ATTN:
             if ".indexer." in kind:
                 src = f"{PREFIX}layers.{li}.{kind}"
                 assert src not in plan.scales
-                assert plan.dropped[src] == WC.DROP_INDEXER
+                assert src not in plan.dropped
+                assert plan.simple[f"layers.{li}.{kind}"] == src
+                n += 1
         for kind in ("hc_attn_fn", "hc_ffn_fn", "hc_attn_scale"):
             assert f"{PREFIX}layers.{li}.{kind}" not in plan.scales
+    assert n == 77
 
 
 def test_expert_and_mlp_weights_are_all_fp8(plan):
@@ -285,6 +290,24 @@ def test_experts_stack_into_two_parameters(plan):
     assert sorted(gu) == list(range(E))
     assert set(gu[0]) == {"gate_proj", "up_proj"}
     assert sorted(plan.expert_down["layers.4.mlp.down_proj"]) == list(range(E))
+
+
+def test_targets_are_exactly_the_oracles_parameters(plan):
+    """Every oracle parameter is filled and no target is invented: the plan's targets
+    equal the real-config FlashTextModel's state_dict keys. Built on the meta device,
+    so no memory is allocated."""
+    from glm5_next import reference as R
+    with torch.device("meta"):
+        keys = set(R.FlashTextModel(R.FlashCfg()).state_dict())
+    assert not keys - plan.targets, f"oracle parameters with no source: {sorted(keys - plan.targets)[:5]}"
+    assert not plan.targets - keys, f"targets the oracle does not have: {sorted(plan.targets - keys)[:5]}"
+    assert len(keys) == 1262
+
+
+def test_plan_totals_reconcile(wm, plan):
+    """1144 simple + 34x3 conv + 42x288x2 gate_up + 42x288 down + 36467 scales + 2107 dropped."""
+    assert (len(plan.simple), len(plan.conv), len(plan.scales), len(plan.dropped)) == (1144, 34, 36467, 2107)
+    assert 1144 + 34 * 3 + 42 * 288 * 2 + 42 * 288 + 36467 + 2107 == len(wm) == 76108
 
 
 def test_every_source_is_accounted_for_exactly_once(wm, plan):
@@ -361,6 +384,7 @@ def test_plan_against_real_index():
     p = WC.plan_from_index(wm)
     assert len(wm) == 76108
     assert len(p.scales) == 36467          # 37,338 total minus the MTP layer's 871
-    assert len(p.dropped) == 2184
+    assert len(p.dropped) == 2107          # 1760 MTP + 347 vision; the 77 indexer tensors are now mapped
+    assert len(p.simple) == 1144 and len(p.targets) == 1262
     assert len(p.conv) == 34
     assert len(p.expert_gate_up) == len(p.expert_down) == 42

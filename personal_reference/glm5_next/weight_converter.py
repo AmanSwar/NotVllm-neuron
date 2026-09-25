@@ -33,7 +33,8 @@ Verified against the live index and safetensors headers on 2026-09-25:
   plus ``q_a_proj``, ``q_b_proj``, ``kv_a_proj_with_mqa`` and ``o_proj`` on the 11
   sparse-MLA layers and the MTP layer.
 * BF16: everything in the 34 KDA layers, **``kv_b_proj``** (note the asymmetry
-  with ``q_b_proj``), the whole indexer, every norm, every ``hc_*``,
+  with ``q_b_proj``), the whole indexer (7 tensors per sparse-MLA layer, mapped
+  under their own names), every norm, every ``hc_*``,
   ``embed_tokens``, ``lm_head``, ``mlp.gate.weight``.
   ``mlp.gate.e_score_correction_bias`` is F32.
 
@@ -68,7 +69,6 @@ class ConversionError(Exception):
 # Reasons a recognised tensor is deliberately not loaded.
 DROP_VISION = "vision tower (scope is text-only)"
 DROP_MTP = f"MTP draft layer {MTP_LAYER} (not wired in the oracle)"
-DROP_INDEXER = "DSA indexer (oracle runs the sparse-MLA layers dense)"
 
 
 @dataclass
@@ -98,8 +98,6 @@ def drop_reason(name: str) -> str | None:
         return DROP_VISION
     if re.search(rf"\.layers\.{MTP_LAYER}\.", name):
         return DROP_MTP
-    if ".self_attn.indexer." in name:
-        return DROP_INDEXER
     return None
 
 
@@ -127,6 +125,13 @@ _RULES: list[tuple[re.Pattern, str]] = [
      r"\1.self_attn.\2.weight"),
     (re.compile(r"^(layers\.\d+)\.self_attn\.(q_a_layernorm|kv_a_layernorm)\.weight$"),
      r"\1.self_attn.\2.weight"),
+    # DSA indexer: the oracle keeps the checkpoint's names, so this is the identity
+    (re.compile(r"^(layers\.\d+)\.self_attn\.indexer\.(wq_b|wk|weights_proj)\.weight$"),
+     r"\1.self_attn.indexer.\2.weight"),
+    (re.compile(r"^(layers\.\d+)\.self_attn\.indexer\.k_norm\.(weight|bias)$"),
+     r"\1.self_attn.indexer.k_norm.\2"),
+    (re.compile(r"^(layers\.\d+)\.self_attn\.indexer\.(index_kpool_compress_ape|index_kpool_compress_gate)$"),
+     r"\1.self_attn.indexer.\2"),
     # dense MLP (layers 0-2)
     (re.compile(r"^(layers\.\d+)\.mlp\.(gate_proj|up_proj|down_proj)\.weight$"),
      r"\1.mlp.\2.weight"),

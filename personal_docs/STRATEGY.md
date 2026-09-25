@@ -221,9 +221,19 @@ From PR #40's write-up, all real and none of it model math:
 
 `nkilib` is Apache-2.0, full source at
 [aws-neuron/nki-library](https://github.com/aws-neuron/nki-library). It ships
-bundled inside `neuronx-cc`. **There is no separate `nki-library` pip package** —
-`https://pip.repos.neuron.amazonaws.com/nki-library/` returns 404 (checked
-2026-09-25), so whatever `neuronx-cc` bundles is what you get.
+bundled inside `neuronx-cc`. **There is no separate AWS `nki-library` pip
+package**, and the way it is missing is a trap rather than an error (checked
+2026-09-25):
+
+- On the Neuron index, `https://pip.repos.neuron.amazonaws.com/nki-library/`
+  returns **404**.
+- On **PyPI**, `nki-library` **exists** — version 0.0.2, no summary, no author,
+  no homepage, two files, releases 0.0.1 and 0.0.2. That is a placeholder, not
+  AWS's library.
+
+So `pip install nki-library` — which an earlier draft of this section
+recommended — **succeeds and installs a stub**. It does not fail loudly. Whatever
+`neuronx-cc` bundles is what you actually get.
 
 > **Correction, 2026-09-25.** The table below was built from a *source checkout*
 > of nki-library. It does **not** describe the installed package. Verified

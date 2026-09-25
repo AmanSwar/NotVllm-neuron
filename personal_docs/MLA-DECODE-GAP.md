@@ -17,6 +17,18 @@ what source could not settle.
 
 ---
 
+> **Update 2026-09-25 (2) — tier 1 ran too.** The **aliasing question is answered
+> decisively: one latent tensor as both `k_prior` and `v_prior` gives bit-identical
+> output** (0.000e+00, every config), and at `tp_k_prior=True` the two have identical
+> shapes — so §2's one-tensor latent cache is sound and needs no second layout. The
+> semantic mapping holds (nkilib's decode reference computes MLA absorbed attention,
+> corr ≥ 0.9975 against an independent fp32 golden), but **reference-vs-reference is the
+> wrong numerics gate**: `attention_tkg_torch_ref` faithfully emulates bf16 hardware
+> arithmetic while the MLA ref computes fp32, so they differ by 10-30x bf16 epsilon by
+> construction. The right gate is kernel-vs-its-own-reference, which upstream already
+> runs at `d_head=512`. **The NKI kernel itself was never executed at `q_head=64`.** A
+> new unquantified risk: whether bf16 latent decode is adequate at 1M context.
+>
 > **Update 2026-09-25 — the spike ran, at a cheaper tier than this document planned.**
 > `q_head = 64` at `d_head = 512` **validates**, as predicted, at `s_active` 1 and 2 and
 > across `bs` 1-64; DeepSeek's 576 is rejected with exactly the predicted assert.

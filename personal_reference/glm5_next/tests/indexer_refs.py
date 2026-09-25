@@ -8,10 +8,10 @@ Anything that is not a verbatim copy says so.
 
 * ``HFIndexer``: transformers 5.17.0,
   ``models/glm5_next/modeling_glm5_next.py:739-1027`` (``Glm5NextTextIndexer``).
-  ``forward``, ``get_visible_tokens``, ``get_pooled_states`` and
-  ``append_visible_tail`` are verbatim, except that the ``past_key_values`` branch
-  is removed (prefill only) and ``__init__`` takes plain values rather than a
-  config. It has no short-sequence shortcut, so it always runs the sparse path.
+  The code of ``forward``, ``get_visible_tokens``, ``get_pooled_states`` and
+  ``append_visible_tail`` is verbatim. Docstrings and illustrative comments are
+  trimmed, the ``past_key_values`` branch is removed (prefill only), and
+  ``__init__`` takes plain values rather than a config. It has no short-sequence shortcut, so it always runs the sparse path.
 * ``vllm_select``: vLLM @ 36fa72d2d0. The torch helpers ``expand_pools_to_tokens``,
   ``append_tail_to_topk`` (``nvidia/ops/kpool_compress.py:727-829``) and
   ``_fill_causal_indices`` (``common/sparse_indexer.py:109``) are verbatim.

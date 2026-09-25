@@ -35,6 +35,10 @@ What this file establishes:
 7. **Tail cache.** Prefill-then-decode equals one-shot prefill, for every
    ``S0 % 4``, across pool completions and across the 2051 ceiling. A stale
    ring (stash only on completion) and an unseeded tail are both caught.
+8. **Injected indices.** ``SparseMLAttention(topk_indices=...)`` with the oracle's
+   own indices is bit-identical, through decode as well. Given a device's
+   noisy-score selection, it separates a 0.5% softmax-scale bug (>1000x the floor)
+   from selection divergence, which otherwise swallows the bug completely.
 
 Hidden size and ``q_lora_rank`` are shrunk in the real-geometry tests. They only
 size the input projections; nothing about selection depends on them.
@@ -664,3 +668,126 @@ def test_no_rope_in_the_indexer_because_qk_rope_head_dim_is_zero():
     """Both references split off qk_rope_head_dim dims for RoPE; it is 0, so none is
     applied and indexer_rope_interleave is inert. If this changes, the indexer needs RoPE."""
     assert R.FlashCfg().qk_rope_head_dim == 0
+
+
+# ================================================================ 8. injected indices
+# SparseMLAttention(topk_indices=...) replaces the indexer's selection for one call, so
+# attention can be validated against a device *given the device's own selection*. FP8
+# scoring legitimately picks different pools, and without this an attention bug hides
+# behind that divergence (test_hook_separates_an_attention_bug_from_selection_divergence).
+def _own_indices(m, x, idx_state=None):
+    with torch.no_grad():
+        return m.indexer(x, m.q_a_layernorm(m.q_a_proj(x)), idx_state)[0]
+
+
+def _layer_inj(m, x, idx, state=None):
+    with torch.no_grad():
+        return m(x, state, topk_indices=idx)
+
+
+def test_injecting_own_indices_is_bit_identical(layer_case):
+    """The hook perturbs nothing: output and returned state match bit for bit (S=3003, lossy)."""
+    m, x, ref, _ = layer_case
+    out, (latent, st) = _layer_inj(m, x, _own_indices(m, x))
+    ref_out, (ref_latent, ref_st) = _layer(m, x)
+    assert torch.equal(out, ref) and torch.equal(out, ref_out)
+    assert torch.equal(latent, ref_latent) and st.length == ref_st.length
+    assert torch.equal(st.pool_k, ref_st.pool_k) and torch.equal(st.tail_k, ref_st.tail_k)
+
+
+def test_injecting_own_indices_is_bit_identical_through_decode():
+    cfg = R.tiny_cfg()
+    torch.manual_seed(0)
+    m = R.SparseMLAttention(cfg).eval()
+    _randomize(m.indexer, 0)
+    x = torch.randn(1, 40, cfg.hidden_size)
+    a, sa = _layer(m, x[:, :25])
+    b, sb = _layer_inj(m, x[:, :25], _own_indices(m, x[:, :25]))
+    assert torch.equal(a, b)
+    for t in range(25, 40):
+        own = _own_indices(m, x[:, t:t + 1], sb[1])
+        a, sa = _layer(m, x[:, t:t + 1], state=sa)
+        b, sb = _layer_inj(m, x[:, t:t + 1], own, state=sb)
+        assert torch.equal(a, b), f"step {t}"
+        assert torch.equal(sa[1].pool_k, sb[1].pool_k) and torch.equal(sa[0], sb[0])
+
+
+def test_injection_is_order_and_padding_invariant(layer_case):
+    """A captured buffer is a set: column order and -1 padding width must not matter."""
+    m, x, ref, _ = layer_case
+    own = _own_indices(m, x)
+    perm = own[..., torch.randperm(own.shape[-1], generator=torch.Generator().manual_seed(0))]
+    padded = torch.nn.functional.pad(perm, (0, 37), value=-1)
+    assert torch.equal(_layer_inj(m, x, padded)[0], ref)
+
+
+def test_injecting_the_causal_set_reproduces_dense(layer_case):
+    """Proves the injected indices really drive the mask: select-all above the ceiling == dense."""
+    m, x, ref, _ = layer_case
+    S = x.shape[1]
+    causal = torch.arange(S).expand(1, S, S).masked_fill(~_causal(S), -1)
+    got = _layer_inj(m, x, causal)[0]
+    assert torch.equal(got, _layer(m, x, dense=True)[0])
+    assert not torch.equal(got, ref)
+
+
+def test_injection_refuses_selections_no_indexer_can_emit():
+    cfg = R.tiny_cfg()
+    m = R.SparseMLAttention(cfg).eval()
+    x = torch.randn(1, 6, cfg.hidden_size)
+    ok = torch.arange(6).expand(1, 6, 6).masked_fill(~_causal(6), -1)
+    _layer_inj(m, x, ok)
+    future = ok.clone(); future[0, 2, 5] = 3
+    dup = ok.clone(); dup[0, 4, 1] = 0
+    for bad, msg in ((future, "future"), (dup, "duplicate"), (ok.clamp(min=-2) - 1, "out of range"),
+                     (ok + 6 * (ok >= 0), "out of range")):
+        with pytest.raises(ValueError, match=msg):
+            _layer_inj(m, x, bad)
+    with pytest.raises(AssertionError, match=r"\[B, S, W\]"):
+        _layer_inj(m, x, ok[:, :5])
+
+
+def _gather_attention(m, x, idx, scale_mult=1.0):
+    """An independent sparse MLA, shaped like FlashMLA's sparse kernel: per query row,
+    gather the selected tokens' K/V and softmax over them. No mask. Stands in for a device."""
+    with torch.no_grad():
+        B, S, _ = x.shape
+        q = m.q_b_proj(m.q_a_layernorm(m.q_a_proj(x))).view(B, S, m.Hh, m.qk)
+        kv = m.kv_b_proj(m.kv_a_layernorm(m.kv_a_proj_with_mqa(x)[..., :m.kvr])).view(B, S, m.Hh, m.qk + m.vd)
+        k, v = kv.split([m.qk, m.vd], -1)
+        out = torch.empty(B, S, m.Hh, m.vd)
+        for b in range(B):
+            for p in range(S):
+                sel = idx[b, p][idx[b, p] >= 0].long()
+                s = torch.einsum("hd,nhd->hn", q[b, p], k[b, sel]) * m.scaling * scale_mult
+                out[b, p] = torch.einsum("hn,nhd->hd", s.softmax(-1), v[b, sel])
+        return m.o_proj(out.reshape(B, S, -1))
+
+
+def test_hook_separates_an_attention_bug_from_selection_divergence(layer_case, monkeypatch):
+    """A 'device' selects with noisy scores (sigma 1e-2 ~ the bf16 score error measured on
+    random weights) and runs its own gather attention. Two devices: correct, and one with a
+    0.5% softmax-scale bug.
+
+    Without the hook both sit ~equally far from the oracle: the bug is invisible inside
+    selection divergence. With the device's indices injected, the correct device agrees to
+    the floor and the bug stands out by >1000x."""
+    m, x, oracle, _ = layer_case
+    S = x.shape[1]
+    g = torch.Generator().manual_seed(0)
+    monkeypatch.setattr(R, "index_scores", lambda q, w, pk, sc, rows=256: _orig_scores(q, w, pk, sc, rows)
+                        + 1e-2 * torch.randn(q.shape[0], q.shape[1], pk.shape[1], generator=g))
+    dev_idx = _own_indices(m, x)
+    monkeypatch.undo()
+    rows = int((_mask(dev_idx, S) != _mask(_own_indices(m, x), S)).any(-1).sum())
+    dev_ok, dev_bug = _gather_attention(m, x, dev_idx), _gather_attention(m, x, dev_idx, 1.005)
+    inj = _layer_inj(m, x, dev_idx)[0]
+    e = lambda a, b: (a - b).abs().max().item()
+    print(f"\n  device selects differently on {rows} rows. without hook: correct {e(oracle, dev_ok):.2e}, "
+          f"0.5% bug {e(oracle, dev_bug):.2e} | with hook: correct {e(inj, dev_ok):.2e}, "
+          f"0.5% bug {e(inj, dev_bug):.2e}")
+    assert rows > 100
+    assert e(oracle, dev_ok) > 1e-3                      # selection divergence is large
+    assert e(oracle, dev_bug) < 1.1 * e(oracle, dev_ok)  # ...and swallows the bug
+    assert e(inj, dev_ok) < 1e-6                         # hook: the correct device agrees to the floor
+    assert e(inj, dev_bug) > 1e3 * e(inj, dev_ok)        # ...and the bug is plain

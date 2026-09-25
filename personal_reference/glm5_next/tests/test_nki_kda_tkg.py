@@ -17,9 +17,15 @@ What it is good for, on a host with no NKI toolchain:
 2. Establishing the **bf16 agreement floor** that the real equivalence test must be
    built on. The fp32 floor is ~4e-08 and is the wrong number to use.
 3. Pinning the **vacuity control as an assertion** rather than a one-off measurement.
-   The scalar-gate substitution clears the bf16 floor by only ~12-42x, versus
-   ~150,000x in fp32. A narrow live margin can quietly stop clearing the floor after
-   an unrelated change, so it is re-asserted on every run.
+   The scalar-gate substitution clears the bf16 floor by ~54x (real gate) and only
+   ~4x (long decay), versus ~150,000x in fp32. A narrow live margin can quietly stop
+   clearing the floor after an unrelated change, so it is re-asserted on every run.
+
+**The model was subsequently validated against the kernel itself.** Run under
+``nki.simulate`` on 2026-09-25, the real kernel gave a scalar-gate margin of **54.4x**
+against this model's predicted 57.8x, and matched the fp32 oracle to 0.53-0.66%.
+So the transcription was faithful. That does not retroactively make this file a test
+of the kernel -- it makes it a design tool whose predictions happened to hold once.
 """
 from __future__ import annotations
 
@@ -126,10 +132,13 @@ def _floor_and_shift(decay, seed=0):
 
 # ---------------------------------------------------------------- the model vs oracle
 # The floor here is NOT the fp32 agreement floor (~4e-08) and NOT the fp32-core-with-
-# bf16-internals floor (~5e-04) I first measured. The kernel's `out` buffer is declared
-# bfloat16, so the returned value is quantised to bf16: ~0.4% relative, and measured at
-# 0.36-0.63%, matching the bf16 ULP at these magnitudes. Any equivalence test against
-# this kernel is bounded by that, and must be stated in RELATIVE terms.
+# bf16-internals floor (~5e-04) I first measured. It is ~0.4-0.7% relative and comes
+# from BF16 ARITHMETIC THROUGHOUT -- S_bf is re-cast before each matmul, delta_bf and
+# k_f are bf16 -- not, as an earlier version of this comment claimed, primarily from
+# the bf16 `out` buffer. Measured under nki.simulate: the fp32 `state_out` carries a
+# COMPARABLE floor (0.62% real / 0.59% long vs the output's 0.66% / 0.36%), so dropping
+# the output cast buys almost nothing. Any equivalence test must be stated in RELATIVE
+# terms, and the smallest detectable error at either surface is ~0.6% of the output.
 BF16_REL = 0.01          # bf16 output quantisation, with headroom (2^-8 = 0.39%)
 
 

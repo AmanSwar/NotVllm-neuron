@@ -106,11 +106,27 @@ The MLA latent cache is replicated per rank at 11 KiB/token.
 
 TP=64 for three reasons, in order of weight:
 
-- It **minimises the KDA state page**, which is the quantity that drives §4's page-size
-  reconciliation. At TP=64 the smallest viable attention block size is 96 tokens; at
-  TP=16 the state page is 271,360 B — which, not coincidentally, is exactly the figure
-  PR #54 calls out as factoring into `1024 x 5 x 53` and divisible by no sane block size.
-  Lower TP makes the hardest problem harder.
+- It **minimises the KDA state page** — which is the honest claim; it does **not** avoid
+  the awkward factorisation, and that distinction matters. The page is exactly
+
+  ```
+  page(TP) = (64/TP) x 128 x 128 x 4   +   (24576/TP) x 3 x 2   =   265 x 2^14 / TP
+                 recurrent, fp32              conv window, bf16        265 = 5 x 53
+  ```
+
+  so **the `5 x 53` factor is TP-invariant**: 67,840 at TP=64, 135,680 at TP=32, 271,360
+  at TP=16 — all of them `265 x` a power of two. No TP choice makes the state page
+  divide a sane attention page, so PR #54's grow-and-pad reconciliation is required
+  either way. TP only scales the magnitude, and smaller is better: at TP=64 the smallest
+  viable attention block size is 96 tokens.
+
+  Worth noting separately that PR #54 reports the identical value, 271,360, for
+  **Qwen3.5 at TP=4** — a different model at a different TP degree, and a coincidence of
+  value rather than a measurement of ours. It is still weak evidence that this class of
+  recurrent-state page factors badly in general, which is the only use made of it here.
+- **TP=64 is also the ceiling**, not merely a choice. `kda_state_shape` divides the 64
+  KDA heads across ranks, so TP must divide 64; above it there is no head per rank. The
+  recommendation therefore sits at a hard boundary rather than in the middle of a range.
 - It is the only setting where BF16 weights leave real headroom: 10 GiB of 24 GiB.
 - The hardware is already a trn2.48xlarge; there is no saving from using less of it.
 

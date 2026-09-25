@@ -393,11 +393,26 @@ The indexer's 132 is `index_head_dim + index_head_dim // quant_block_size * 4` =
 figures come from `kda_state_shape(tp=64, num_heads=64, head_dim=128,
 conv_kernel_size=4)` and `kda_state_dtype` → conv bf16, recurrent fp32.
 
-Sensitivity, since TP is not fixed: the KDA state page is 135,680 B at TP=32 and
-**271,360 B at TP=16** — which is, by coincidence, the exact figure PR #54 quotes for
-Qwen3.5's DeltaNet page and calls out as factoring into `1024 × 5 × 53`, i.e. not
-divisible by any sane block size. The same is true here, and it is why
-`mamba_page_size_padded` exists.
+Sensitivity, since TP is not fixed — and the shape of it is exact:
+
+```
+page(TP) = (64/TP) × 128 × 128 × 4  +  (24576/TP) × 3 × 2  =  265 × 2^14 / TP
+               recurrent, fp32             conv window, bf16      265 = 5 × 53
+```
+
+So 67,840 B at TP=64, 135,680 at TP=32, 271,360 at TP=16 — every one of them `265 ×` a
+power of two. **The `5 × 53` factor is TP-invariant**, because both terms scale linearly
+in `1/TP`: no TP choice makes the state page divide a sane attention page, and
+`mamba_page_size_padded` is required at every TP. TP scales the magnitude only.
+
+The `24576 = 3 × 64 × 128` conv width is corroborated independently of vLLM's
+`kda_state_shape`: dev1's oracle declares `nn.Conv1d(3*H*K, ...)` and the weight
+converter finds exactly 34 three-source `{q,k,v}_conv1d` concatenations.
+
+PR #54 quotes the identical value, 271,360, for **Qwen3.5's DeltaNet page at TP=4**. That
+is a different model at a different TP degree — a coincidence of value, not a measurement
+of this one. It is weak corroboration that this class of recurrent-state page factors
+badly in general, and nothing more is claimed from it.
 
 ### The indexer page can never be unified, for any block size
 

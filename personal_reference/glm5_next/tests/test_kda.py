@@ -18,6 +18,21 @@ while proving nothing:
    scalar. ``test_gate_is_per_channel_not_scalar`` substitutes the scalar form and
    asserts the comparison *notices*, so the suite cannot silently accept a GDN
    kernel dropped in where KDA was meant.
+
+**A SINGLE TEST REGIME IS NEVER SUFFICIENT HERE, AND THE RIGHT ONE DIFFERS PER
+PROPERTY.** This has now bitten three times on this model, always the same way: the
+regime that exercises one property is the weak one for the next.
+
+* chunk-vs-recurrent carry: the LONG-decay regime is strong (the carry matters);
+  the real gate forgets state within a few tokens and hides carry bugs.
+* per-channel-vs-scalar gate: the REAL gate is strong (exp(g) spreads wide, so the
+  two gates diverge); in the long regime everything sits near 1 and they nearly
+  coincide -- only 4.2x the bf16 floor on the real kernel, too thin to gate on.
+* input-perturbation probes: weak under the real gate (3x) precisely because it
+  forgets state, stronger under long decay (6.5x).
+
+So do not inherit a regime, or a threshold, from a neighbouring test. Pick the regime
+that makes the property under test visible, and say which one you picked and why.
 """
 from __future__ import annotations
 

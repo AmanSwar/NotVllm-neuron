@@ -138,7 +138,18 @@ Models above it fall off the fused attention path entirely. PR #40 (MiMo-V2.5,
 port worked around it by hot-swapping `sys.modules` to a forked `nkilib` with
 `_MAX_HEAD_DIM=256`.
 
-**Affects us directly:** Qwen3.8-27B is `head_dim: 256`; MiMo-V2.6-Pro is 192.
+**Not a concern for Qwen3.8-27B** (`head_dim: 256`), verified 2026-09-25 against
+PR #54 as merged. Its full-attention layers never enter the fused path at all:
+there is no `NF.`/`flash_attention`/`segmented_attention` call anywhere in
+`model/qwen3_5/model.py` — the sole mention of `NF.flash_attention` is inside a
+docstring. Both `forward_prefill` and `forward_decode` compute attention inline
+in fp32 (`q.float() @ k.float().transpose(-1, -2)` then `torch.softmax`), so
+`MAX_HEAD_DIM` is never reached and there is nothing to work around. The
+`sys.modules` hot-swap should **not** be attempted here. PR #54 measures the cost
+of the eager path at 6–8% of prefill, i.e. a **performance** item, not a
+correctness gate.
+
+Still live for **MiMo-V2.6-Pro** (192), which has no such port yet.
 
 ### 3.3 No recurrent-state cache (as of this fork point)
 
@@ -267,9 +278,31 @@ HuggingFace configs on 2026-09-24.
 - **55.6 GB / 18 shards.** Fits a single Trainium2 chip with room for KV.
 - transformers reference: `modeling_qwen3_5.py` ✅
 
-Watch: `head_dim: 256` (§3.2), `partial_rotary_factor: 0.25`, interleaved mRoPE
-`[11, 11, 10]`, `attn_output_gate: true` with a swish gate. The RoPE and gating
-details are where silent numerical bugs hide.
+Watch: `partial_rotary_factor: 0.25`, interleaved mRoPE `[11, 11, 10]`, and the
+two **separate** gates — `attn_output_gate: true` is a **sigmoid** on the
+full-attention output, while `output_gate_type: "swish"` is the activation of the
+DeltaNet block's gated RMSNorm (swish ≡ SiLU). Conflating them is easy and wrong.
+
+`head_dim: 256` is **not** a concern here — see §3.2.
+
+All four of those were checked against the `transformers` reference at this
+checkpoint's exact dimensions on 2026-09-25 and match bit-exactly (mRoPE cos/sin,
+partial rotary on q and k, both RMSNorm variants, the attention gate). Note the
+asymmetry the port gets right: the plain RMSNorm scales by `(1 + weight)`, the
+gated one by plain `weight`.
+
+Two further findings from that evaluation:
+
+- **PR #54 needs no new model code for this checkpoint.** `Qwen3_5Config.from_hf`
+  takes the published config unchanged, and all 851 text-decoder tensors are
+  predicted exactly from it (0 mismatched, 0 unexplained, 0 missing).
+- The only tensor-level difference from Qwen3.5-27B is that `linear_attn.A_log`
+  and `linear_attn.norm.weight` moved F32 → BF16. It is already handled:
+  `model.py` coerces `dt_bias`/`A_log` to float32 *before* a
+  `load_state_dict(..., assign=True)`, which would otherwise replace the
+  parameters without casting and run `A_log.exp()` in bf16.
+
+Full write-up: `dev/progress/2026-09-25-qwen38-27b-pr54-findings.md`.
 
 ### MiMo-V2.6-Pro-RL — second
 

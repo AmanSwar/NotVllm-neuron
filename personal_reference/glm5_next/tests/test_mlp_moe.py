@@ -159,15 +159,51 @@ def test_clamp_is_asymmetric_gate_upper_only():
 
 
 # ----------------------------------------------------------------------- blast radius
-def test_both_mlp_call_sites_carry_the_limit():
-    """45 of 45 layers: dense FFN on layers 0-2, shared_experts on the other 42."""
-    cfg = R.tiny_cfg()
-    dense = R.DecoderLayer(cfg, 0)
-    moe = R.DecoderLayer(cfg, 3)
-    assert isinstance(dense.mlp, R.MLP) and dense.mlp.limit == cfg.swiglu_limit
-    assert isinstance(moe.mlp, R.MoE) and moe.mlp.shared_experts.limit == cfg.swiglu_limit
-    # and the routed experts, which were always right, still agree on the limit
-    assert moe.mlp.limit == cfg.swiglu_limit
+def test_every_layer_carries_the_limit_at_every_mlp_site():
+    """The clamp must reach EVERY MLP-bearing site on EVERY layer, not two samples.
+
+    An earlier version of this test pinned index 0 (dense) and index 3 (MoE) only.
+    dev1 found the mutation that defeats it: shift ``mlp_layer_types`` LEFT by one and
+    both sampled indices still match, while layer 2 flips kind. **Two sampled indices
+    cannot pin a property of all layers** -- the same sampling error, in a test written
+    to catch a sampling-shaped bug.
+
+    Scope note: this asserts the limit is WIRED wherever an MLP exists. It is
+    deliberately NOT a dispatch test -- it does not check that each layer picks the
+    right attention or MLP kind. That is a separate property with its own file.
+    """
+    # A NON-DEFAULT limit, so the test proves the value is wired through rather than
+    # coinciding with a default. (MLP's limit used to default to 10.0 -- the real
+    # swiglu_limit -- which made an unwired call site invisible. It is now required.)
+    cfg = R.tiny_cfg(swiglu_limit=7.5)
+    seen_dense = seen_moe = 0
+    for i in range(cfg.num_hidden_layers):
+        layer = R.DecoderLayer(cfg, i)
+        if isinstance(layer.mlp, R.MLP):
+            assert layer.mlp.limit == cfg.swiglu_limit, f"layer {i}: dense MLP limit"
+            seen_dense += 1
+        else:
+            # MoE clamps in two places: the routed path inline, and shared_experts via MLP
+            assert layer.mlp.limit == cfg.swiglu_limit, f"layer {i}: MoE routed limit"
+            assert layer.mlp.shared_experts.limit == cfg.swiglu_limit, (
+                f"layer {i}: shared_experts limit -- this is the site that was unclamped"
+            )
+            seen_moe += 1
+    assert seen_dense > 0 and seen_moe > 0, "config exercised only one MLP kind"
+    assert seen_dense + seen_moe == cfg.num_hidden_layers
+
+
+def test_the_real_config_has_an_mlp_on_every_layer():
+    """45/45: the blast radius claim, checked against the real layer lists rather than
+    inferred. Constructing 45 real DecoderLayers (288 experts each) is not viable, so
+    this checks the config pattern; the wiring itself is checked above on tiny_cfg."""
+    cfg = R.FlashCfg()
+    assert len(cfg.mlp_layer_types) == cfg.num_hidden_layers == 45
+    assert set(cfg.mlp_layer_types) == {"dense", "sparse"}
+    dense = [i for i, t in enumerate(cfg.mlp_layer_types) if t == "dense"]
+    assert dense == [0, 1, 2], f"first_k_dense_replace changed: {dense}"
+    # every layer has an MLP: dense ones directly, sparse ones via shared_experts
+    assert len(cfg.mlp_layer_types) == 45 and cfg.n_shared_experts >= 1
 
 
 def test_routed_experts_and_shared_expert_use_the_same_limit_semantics():

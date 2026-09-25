@@ -160,13 +160,30 @@ class UnweightedRMSNorm(nn.Module):
         return x * torch.rsqrt(x.float().square().mean(-1, keepdim=True) + self.eps).to(x.dtype)
 
 class RMSNormGated(nn.Module):
-    """FLA-style: rmsnorm(x) * weight * silu(gate). Per-head (dim = head_dim)."""
+    """rmsnorm(x) * weight * **sigmoid**(gate). Per-head (dim = head_dim).
+
+    The gate is ``sigmoid``, NOT ``silu``/``swish``. This is an architecture constant
+    with no config key: ``linear_attn_config`` carries no ``output_gate_type``, and the
+    top-level ``hidden_act: silu`` is the MLP's activation, not this one. Both references
+    hardcode sigmoid -- transformers 5.17 ``Glm5NextTextRMSNormGated.activation =
+    "sigmoid"``, and vLLM ``kda.py:291`` ``FusedRMSNormGated(head_dim,
+    activation="sigmoid")``. FLA offers both branches and its *default is swish*
+    (``y*g*sigmoid(g)``), so vLLM's ``activation="sigmoid"`` is a deliberate override,
+    not an omission.
+
+    This read silu until 2026-09-25, inherited from the Qwen3.8-27B lineage where
+    ``output_gate_type: "swish"`` genuinely is silu. GLM-5.3-Flash is not that model.
+    The error was worth 194% relative / cosine 0.64 on every one of the 34 KDA layers,
+    and no test saw it: nothing compared this against an external reference, and
+    ``test_layer_prefill_matches_step_decode`` compares the layer with itself, which a
+    wrong activation satisfies exactly. ``tests/test_kda.py`` now pins it both ways.
+    """
     def __init__(self, dim, eps):
         super().__init__(); self.weight = nn.Parameter(torch.ones(dim)); self.eps = eps
     def forward(self, x, gate):
         xf = x.float()
         y = xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + self.eps) * self.weight.float()
-        return (y * F.silu(gate.float())).to(x.dtype)
+        return (y * torch.sigmoid(gate.float())).to(x.dtype)
 
 def l2norm(x, dim=-1, eps=1e-6):
     return x * torch.rsqrt((x * x).sum(dim, keepdim=True) + eps)

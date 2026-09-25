@@ -279,6 +279,13 @@ the vendored copy and the bundled `nkilib` will drift, and nothing checks it.
 Before relying on any `nkilib/experimental/` module, **check it is installed**.
 For these the question is absence, not version skew.
 
+And check what it is tested against. dev2 found that `gdn_tkg`'s entire upstream
+test table is a **single case** — `test_gdn_tkg.py:88`,
+`test_cases_basic = [(24, 128, 128, bfloat16)]`, which at `NUM_V_HEADS=12` is
+batch 2. `gdn_cte` has both a basic and a large table. So the **decode** kernel
+this roadmap leans on has one test point, and GLM-5.3-Flash needs 64 heads
+against that point's 24.
+
 ### How kernels are wired
 
 Models never call NKI directly — they call `vllm_neuron.functional` (`NF`). The

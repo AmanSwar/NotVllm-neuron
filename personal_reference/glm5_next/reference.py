@@ -71,10 +71,14 @@ Two consequences that look like bugs and are not:
 Scoring here is exact fp32. vLLM scores in FP8 — Hadamard-128 then e4m3 with
 power-of-two scales on both q and pool keys — which reorders near-ties, so a
 device and this oracle can legitimately disagree about *which* tokens are
-selected. Measured on random weights (dev/progress, 2026-09-25): FP8 changes at
-least one selected pool on 88-97% of lossy rows (mean pool overlap ~99.4%), and
-bf16 alone on 38-62%. Validate on device by score closeness plus pool-set
-overlap, not by exact index equality. [unverified] on the real weights.
+selected. Measured 2026-09-25 (dev/progress) with the REAL indexer weights of
+layers 3/23/43 and synthetic activations: FP8 changes at least one selected pool
+on 94-96% of lossy rows at S=3003 and 100% at S=16387, where mean pool overlap
+falls to ~0.97 (worst row 0.92); bf16 alone changes 39-42% -> 87-89%. The top-k
+cut gap shrinks as context grows. Validate on device by score closeness, the
+pool-overlap distribution, and attention with the device's own selection
+injected (``topk_indices``), never by exact index equality. [unverified] with
+real activations.
 
 ``FlashCfg.sparse_mla_dense = True`` restores plain causal attention, which is
 exact for seq_len <= 2051 and is the baseline the indexer's continuity test

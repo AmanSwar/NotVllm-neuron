@@ -130,6 +130,9 @@ class FlashCfg:
     routed_scaling_factor = 2.5
     norm_topk_prob = True
     swiglu_limit = 10.0
+    hidden_act = "silu"          # conv1d + MLP activation; the oracle hardcodes F.silu
+    n_group = 1                  # TopkRouter omits group masking: identity only at 1
+    topk_group = 1
     first_k_dense_replace = 3
     intermediate_size = 12288
     layer_types = ["linear_attention" if i % 4 != 3 else "deepseek_sparse_attention" for i in range(45)]
@@ -148,6 +151,21 @@ class FlashCfg:
 
 # ------------------------------------------------------------------------------ norms
 class RMSNorm(nn.Module):
+    """rmsnorm in fp32, multiply by ``weight`` in fp32, cast once at the end.
+
+    **A deliberate divergence from transformers, kept on purpose.** transformers casts
+    the normalised value back to the input dtype BEFORE multiplying by ``weight``
+    (``Glm5NextTextRMSNorm.forward``), i.e. one extra rounding. In fp32 the two are
+    bit-identical, so this only shows up in bf16 -- where the oracle is *more* accurate.
+    An oracle's job is maximum-precision ground truth, not reproducing one deployment's
+    rounding; emulating it would make this a worse reference. Pinned by
+    ``tests/test_norms_router.py``, which asserts fp32 equivalence and records the bf16
+    gap so nobody later "fixes" the oracle into being less accurate.
+
+    ``weight``, NOT ``(1 + weight)``. Qwen3.5 uses ``(1 + weight)``; GLM does not, and
+    transformers agrees. Right today and nothing would notice if it stopped being, which
+    is why there is a test.
+    """
     def __init__(self, dim, eps):
         super().__init__(); self.weight = nn.Parameter(torch.ones(dim)); self.eps = eps
     def forward(self, x):
@@ -186,7 +204,17 @@ class RMSNormGated(nn.Module):
         return (y * torch.sigmoid(gate.float())).to(x.dtype)
 
 def l2norm(x, dim=-1, eps=1e-6):
-    return x * torch.rsqrt((x * x).sum(dim, keepdim=True) + eps)
+    """``x / sqrt(sum(x^2) + eps)`` -- transformers/FLA's exact spelling.
+
+    NOT ``x * rsqrt(...)``, which is **Qwen's GDN variant**. transformers carries the
+    warning verbatim: "main difference to qwen's gdn variation: intentionally use sqrt
+    and / to match original triton". The oracle used the Qwen form until 2026-09-25 --
+    the third carry-over from that sibling model after the output gate and the 2051
+    ceiling. Measured 2.98e-08 apart, 0.7-0.9 ULP, not bitwise equal: tiny, but the
+    oracle's whole value is being exactly comparable to the reference family, so an
+    unexplained ULP divergence is a cost with no benefit.
+    """
+    return x / torch.sqrt((x * x).sum(dim, keepdim=True) + eps)
 
 
 # ------------------------------------------------------------------------------- mHC
@@ -517,7 +545,12 @@ class SparseMLAttention(nn.Module):
             assert topk_indices.shape[:2] == (B, S), "topk_indices must be [B, S, W]"
             mask = injected_mask(topk_indices.long(), L).unsqueeze(1)
         att = (q @ k.transpose(-1, -2)) * self.scaling
-        att = att.masked_fill(~mask, float("-inf")).softmax(-1)
+        # fp32 softmax, made explicit. transformers' eager_attention_forward spells this
+        # as softmax(dtype=float32).to(query.dtype); the oracle keeps the fp32 result and
+        # does NOT cast back down -- same reasoning as RMSNorm above. The downcast is a
+        # deployment choice, and an oracle should not adopt one. torch already accumulates
+        # bf16 softmax in fp32, so the explicit dtype is about the contract, not accuracy.
+        att = att.masked_fill(~mask, float("-inf")).softmax(-1, dtype=torch.float32)
         return self.o_proj((att @ v).transpose(1, 2).reshape(B, S, -1)), (latent, idx_state)
 
 

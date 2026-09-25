@@ -33,37 +33,53 @@ per-head **scalar** ``exp(g)``; KDA scales each K row by its **own** ``exp(g[k])
 is substituted — the two agree closely enough on short, fast-decaying sequences
 that a weak test cannot tell them apart.
 
-Scope and validity ceiling
+Scope, and the DSA indexer
 --------------------------
-Text decoder only. The 11 sparse-MLA layers run DENSE causal attention with no
-indexer, which is **exact for seq_len <= 2051 and wrong above it** — not
-approximate above it: the oracle attends to tokens the model's indexer excludes.
+Text decoder only. The 11 sparse-MLA layers run the **real DSA indexer**
+(``Indexer``), so the oracle is ground truth above 2048 tokens. Its practical
+limit is CPU time, not correctness.
 
-2051 is ``index_topk + index_kpool - 1``. The indexer scores only the
-``L // index_kpool`` *complete* pools, selects ``index_topk // index_kpool`` of
-them, and ``index_kpool_always_select_tail`` appends the ``L % index_kpool``
-tokens of the incomplete pool raw, so every token is covered while
-``L // 4 <= 512``. vLLM's own short-sequence gate is ``seq_len <= index_topk``
-(2048): correct, but conservative, not the ceiling. An earlier version of this
-docstring said 2048, from counting ``ceil(L / 4)`` pools, which wrongly treats the
-incomplete pool as a scoring candidate.
+The algorithm, cross-checked against both vLLM
+(``vllm/models/glm5next/{common,nvidia}/``) and transformers 5.17's
+``Glm5NextTextIndexer`` — ``tests/test_indexer.py`` compares against both:
 
-Verified 2026-09-25 against vLLM's implementation and transformers 5.17's
-``Glm5NextTextIndexer``. The question that mattered was whether
-``index_kpool_compress`` means attention runs over compressed pool representatives
-(which would make selecting every pool still lossy). It does not: vLLM keeps the
-compressed entries in a separate ``Glm5NextIndexerCache`` used only for scoring,
-keeps the in-progress pool's **raw** K in ``Glm5NextTailCache``, and has attention
-gather full-fidelity tokens by the token indices the indexer emits.
+* ``k = LayerNorm(wk(x))`` (eps 1e-6, with bias), ``q = wq_b(q_c)`` where ``q_c``
+  is the MLA's own ``q_a_layernorm(q_a_proj(x))``; per-head weights
+  ``weights_proj(x) * n_heads**-0.5``; per-token gate
+  ``x @ index_kpool_compress_gate.T``.
+* Pool ``j`` covers tokens ``[4j, 4j + 4)``. Its key is
+  ``sum_i softmax_i(gate_i + ape_i) * k_i``, the softmax taken over the 4 slots
+  **per channel**.
+* Pool score ``sum_h w_h * relu(head_dim**-0.5 * q_h . pool_k)``.
+* Candidates are **complete pools only**: ``j < L // 4`` for a query seeing ``L``
+  tokens. A pool holding future tokens is never scored.
+* Top ``index_topk // index_kpool`` (512) pools are expanded back to tokens, and
+  ``index_kpool_always_select_tail`` appends the ``L % 4`` raw tokens of the
+  incomplete pool. Attention runs over exactly those tokens.
+* ``qk_rope_head_dim`` is 0, so neither reference applies RoPE in the indexer, and
+  ``indexer_rope_interleave`` has no effect on this model.
 
-``tests/test_dense_mla_exactness.py`` pins the five things this depends on, so a
-config change trips a test rather than silently invalidating the oracle.
+Two consequences that look like bugs and are not:
 
-**Milestone 2 targets 1M context; this oracle reaches 2051.** Validating anything
-longer needs a real indexer here.
+* Selecting everything is exact to seq_len **2051** (``index_topk + index_kpool
+  - 1``), not 2048. vLLM's short-sequence gate at 2048 is conservative. See
+  ``tests/test_dense_mla_exactness.py``.
+* Above that, when ``L % 4 == 0`` the tail is empty and the query's own token
+  must win top-k on merit. **A token is not guaranteed to attend to itself.** Do
+  not force-include it: both references would disagree.
+
+Scoring here is exact fp32. vLLM scores in FP8 — Hadamard-128 then e4m3 with
+power-of-two scales on both q and pool keys — which can reorder near-ties, so a
+device and this oracle can legitimately disagree about *which* tokens are
+selected. [unverified] how often; not yet measured.
+
+``FlashCfg.sparse_mla_dense = True`` restores plain causal attention, which is
+exact for seq_len <= 2051 and is the baseline the indexer's continuity test
+compares against.
 """
 from __future__ import annotations
 import math
+from dataclasses import dataclass
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -91,6 +107,14 @@ class FlashCfg:
     qk_nope_head_dim = 256
     qk_rope_head_dim = 0
     v_head_dim = 256
+    # DSA indexer (one per sparse-MLA layer; indexer_types is "full" on all 45)
+    index_n_heads = 32
+    index_head_dim = 128
+    index_topk = 2048
+    index_kpool = 4
+    index_kpool_compress = True
+    index_kpool_always_select_tail = True
+    sparse_mla_dense = False        # oracle-only: skip the indexer (exact to seq 2051)
     # MoE
     n_routed_experts = 288
     num_experts_per_tok = 8
@@ -284,9 +308,132 @@ class LinearAttention(nn.Module):
         return self.o_proj(self.o_norm(core, gate).reshape(B, S, -1)), (conv_state, rec_state)
 
 
+# ------------------------------------------------------------------------ DSA indexer
+def kpool_compress(k, gate, ape):
+    """Pool key = softmax over the kpool slots, per channel, of (gate + ape), weighting raw K.
+    k, gate: [..., kpool, D]; ape: [kpool, D] -> [..., D] fp32.
+    vLLM's _kpool_softmax_rotate_write_cache_kernel without its Hadamard + FP8 quant."""
+    p = torch.softmax(gate.float() + ape.float(), dim=-2)
+    return (p * k.float()).sum(-2)
+
+def index_scores(q, w, pool_k, scale, rows=256):
+    """sum_h w[h] * relu(scale * q_h . pool_k[j])  -> [B,S,P] fp32.
+    q: [B,S,Hi,D]; w: [B,S,Hi]; pool_k: [B,P,D]. Row-chunked: [B,S,Hi,P] is large at long S."""
+    B, S = q.shape[:2]
+    out = torch.zeros(B, S, pool_k.shape[1])
+    kT = pool_k.float().transpose(-1, -2).unsqueeze(1)                       # [B,1,D,P]
+    for s0 in range(0, S, rows):
+        sc = F.relu((q[:, s0:s0 + rows].float() @ kT) * scale)              # [B,s,Hi,P]
+        out[:, s0:s0 + rows] = (w[:, s0:s0 + rows, None, :].float() @ sc).squeeze(-2)
+    return out
+
+def select_tokens(scores, lens, topk, kpool, tail=True):
+    """Pool scores -> token indices [B,S,topk (+ kpool-1 if tail)], -1 padded.
+
+    lens: [S] tokens visible to each row. Only complete pools (j < lens // kpool) are
+    candidates; the top min(topk // kpool, candidates) are expanded to tokens, then the
+    incomplete pool's lens % kpool tokens are appended raw. Same layout as vLLM's
+    expand_pools_and_append_tail.
+    """
+    B, S, P = scores.shape
+    n_complete = lens // kpool                                               # [S]
+    cand = torch.arange(P)[None, :] < n_complete[:, None]                   # [S,P]
+    top = scores.masked_fill(~cand, float("-inf")).topk(min(topk // kpool, P), -1).indices
+    ok = cand.expand(B, S, P).gather(-1, top)
+    tok = (top[..., None] * kpool + torch.arange(kpool)).masked_fill(~ok[..., None], -1).flatten(-2)
+    out = F.pad(tok, (0, topk - tok.shape[-1]), value=-1)
+    if not tail:
+        return out
+    off = torch.arange(kpool - 1)
+    start = n_complete * kpool
+    t = (start[:, None] + off).masked_fill(off >= (lens - start)[:, None], -1)
+    return torch.cat([out, t.expand(B, S, -1)], -1)
+
+def indices_to_mask(idx, L):
+    """[B,S,W] token indices (-1 = empty) -> bool [B,S,L]."""
+    safe = torch.where(idx < 0, L, idx)
+    return torch.zeros(*idx.shape[:2], L + 1, dtype=torch.bool).scatter_(-1, safe, True)[..., :L]
+
+@dataclass
+class IndexerState:
+    """Per-layer indexer cache: vLLM's two indexer caches, minus paging and FP8.
+
+    pool_k     [B,P,D]      compressed COMPLETE pools only   (Glm5NextIndexerCache; scoring only)
+    tail_k     [B,kpool,D]  raw K ring, slot = pos % kpool   (Glm5NextTailCache, "K" half)
+    tail_gate  [B,kpool,D]  raw gate-score ring, same slots  (Glm5NextTailCache, "V" half)
+    length     tokens seen
+    Attention never reads any of this; it reads the MLA latents by token index.
+    """
+    pool_k: torch.Tensor
+    tail_k: torch.Tensor
+    tail_gate: torch.Tensor
+    length: int
+
+def indexer_prefill(state, k, gate, ape, kpool):
+    """Append S tokens (continuing ``state`` if given) -> new state; inputs are not mutated.
+    Completes every pool it can, then seeds the ring with the newest min(kpool, S) tokens at
+    pos % kpool, as vLLM's kpool_seed_tail_cache does."""
+    B, S, D = k.shape
+    if state is None:
+        z = k.new_zeros(B, kpool, D)
+        state = IndexerState(torch.zeros(B, 0, D), z, z.clone(), 0)
+    r = state.length % kpool                          # incomplete pool's tokens sit in ring slots [0, r)
+    raw_k, raw_g = torch.cat([state.tail_k[:, :r], k], 1), torch.cat([state.tail_gate[:, :r], gate], 1)
+    n = raw_k.shape[1] // kpool
+    pools = kpool_compress(raw_k[:, :n * kpool].unflatten(1, (n, kpool)), raw_g[:, :n * kpool].unflatten(1, (n, kpool)), ape)
+    tail_k, tail_g = state.tail_k.clone(), state.tail_gate.clone()
+    for i in range(max(0, S - kpool), S):
+        slot = (state.length + i) % kpool
+        tail_k[:, slot], tail_g[:, slot] = k[:, i], gate[:, i]
+    return IndexerState(torch.cat([state.pool_k, pools], 1), tail_k, tail_g, state.length + S)
+
+def indexer_decode(state, k, gate, ape, kpool):
+    """One token, as vLLM's _kpool_decode_update_batched_kernel: if it completes a pool,
+    compress ring slots [0, kpool-1) plus itself; then stash it at pos % kpool.
+    Every token is stashed, not only pool-completing ones -- vLLM once gated the stash on
+    completion and compressed stale prompt-tail entries forever after."""
+    slot = state.length % kpool
+    pool_k = state.pool_k
+    if slot == kpool - 1:
+        ks, gs = torch.cat([state.tail_k[:, :slot], k], 1), torch.cat([state.tail_gate[:, :slot], gate], 1)
+        pool_k = torch.cat([pool_k, kpool_compress(ks, gs, ape)[:, None]], 1)
+    tail_k, tail_g = state.tail_k.clone(), state.tail_gate.clone()
+    tail_k[:, slot], tail_g[:, slot] = k[:, 0], gate[:, 0]
+    return IndexerState(pool_k, tail_k, tail_g, state.length + 1)
+
+class Indexer(nn.Module):
+    """DSA lightning indexer with kpool compression. -> (token indices [B,S,topk+kpool-1], state).
+    Parameter names are the checkpoint's (self_attn.indexer.*)."""
+    def __init__(self, cfg: FlashCfg):
+        super().__init__()
+        assert cfg.index_kpool_compress and cfg.index_kpool > 1, "only the kpool-compressed indexer is implemented"
+        assert cfg.index_topk % cfg.index_kpool == 0, "vLLM asserts this (history_group_budget_for_topk)"
+        Hi, D = cfg.index_n_heads, cfg.index_head_dim
+        self.Hi, self.D, self.topk, self.kpool = Hi, D, cfg.index_topk, cfg.index_kpool
+        self.tail = cfg.index_kpool_always_select_tail
+        self.wq_b = nn.Linear(cfg.q_lora_rank, Hi * D, bias=False)
+        self.wk = nn.Linear(cfg.hidden_size, D, bias=False)
+        self.k_norm = nn.LayerNorm(D, eps=1e-6)                                         # has a bias
+        self.weights_proj = nn.Linear(cfg.hidden_size, Hi, bias=False)
+        self.index_kpool_compress_ape = nn.Parameter(torch.zeros(self.kpool, D))        # [kpool, D]
+        self.index_kpool_compress_gate = nn.Parameter(torch.randn(D, cfg.hidden_size) * 0.02)  # [D, hidden]
+    def forward(self, x, q_c, state=None):
+        B, S, _ = x.shape
+        q = self.wq_b(q_c).view(B, S, self.Hi, self.D)
+        k = self.k_norm(self.wk(x))
+        gate = F.linear(x, self.index_kpool_compress_gate)
+        w = self.weights_proj(x).float() * self.Hi ** -0.5
+        ape = self.index_kpool_compress_ape
+        if state is not None and S == 1: state = indexer_decode(state, k, gate, ape, self.kpool)
+        else: state = indexer_prefill(state, k, gate, ape, self.kpool)
+        lens = torch.arange(state.length - S, state.length) + 1
+        scores = index_scores(q, w, state.pool_k, self.D ** -0.5)
+        return select_tokens(scores, lens, self.topk, self.kpool, self.tail), state
+
+
 # --------------------------------------------------------------------------- NoPE MLA
 class SparseMLAttention(nn.Module):
-    """DeepSeek-V3 MLA with qk_rope_head_dim=0 (NoPE). Dense causal attention == DSA for seq<=2051 (see module docstring)."""
+    """DeepSeek-V3 MLA with qk_rope_head_dim=0 (NoPE), attending only to the tokens the indexer selects."""
     def __init__(self, cfg: FlashCfg):
         super().__init__()
         D, Hh = cfg.hidden_size, cfg.num_attention_heads
@@ -297,19 +444,30 @@ class SparseMLAttention(nn.Module):
         self.kv_a_layernorm = RMSNorm(cfg.kv_lora_rank, cfg.rms_norm_eps)
         self.kv_b_proj = nn.Linear(cfg.kv_lora_rank, Hh * (cfg.qk_nope_head_dim + cfg.v_head_dim), bias=False)
         self.o_proj = nn.Linear(Hh * cfg.v_head_dim, D, bias=False)
+        self.indexer = Indexer(cfg)
+        self.dense = cfg.sparse_mla_dense
         self.scaling = self.qk ** -0.5
-    def forward(self, x, kv_cache=None):
+    def forward(self, x, state=None):
+        """-> (out [B,S,D], (latent [B,L,kv_lora_rank], IndexerState | None)).
+        ``dense`` skips the indexer and attends causally to everything: exact only to seq 2051."""
         B, S, _ = x.shape
-        q = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(x))).view(B, S, self.Hh, self.qk).transpose(1, 2)
+        kv_cache, idx_state = state if state is not None else (None, None)
+        q_c = self.q_a_layernorm(self.q_a_proj(x))                                           # also the indexer's q input
+        q = self.q_b_proj(q_c).view(B, S, self.Hh, self.qk).transpose(1, 2)
         latent = self.kv_a_layernorm(self.kv_a_proj_with_mqa(x)[..., :self.kvr])          # [B,S,512] -- THE KV cache entry
         if kv_cache is not None: latent = torch.cat([kv_cache, latent], 1)
         kv = self.kv_b_proj(latent).view(B, -1, self.Hh, self.qk + self.vd).transpose(1, 2)
         k, v = kv.split([self.qk, self.vd], -1)
         L = k.shape[2]
-        mask = torch.ones(S, L, dtype=torch.bool).tril(L - S)
+        if self.dense:
+            mask = torch.ones(S, L, dtype=torch.bool).tril(L - S)
+        else:
+            assert (idx_state.length if idx_state is not None else 0) == L - S, "indexer state out of step with the KV cache"
+            idx, idx_state = self.indexer(x, q_c, idx_state)
+            mask = indices_to_mask(idx, L).unsqueeze(1)                                   # [B,1,S,L]
         att = (q @ k.transpose(-1, -2)) * self.scaling
         att = att.masked_fill(~mask, float("-inf")).softmax(-1)
-        return self.o_proj((att @ v).transpose(1, 2).reshape(B, S, -1)), latent
+        return self.o_proj((att @ v).transpose(1, 2).reshape(B, S, -1)), (latent, idx_state)
 
 
 # --------------------------------------------------------------------------------- MoE
@@ -394,12 +552,14 @@ def tiny_cfg(**kw) -> FlashCfg:
 
     8 layers keeps the [linear x3, sparse-MLA] x2 pattern and both MLP kinds
     (``first_k_dense_replace=3`` -> layers 0-2 dense, 3+ MoE). Shapes shrink;
-    nothing is removed.
+    nothing is removed. ``index_topk=16`` (kpool stays 4) puts the indexer's lossy
+    regime at seq_len >= 20, so it is cheap to reach.
     """
     base = dict(hidden_size=256, num_hidden_layers=8, linear_num_heads=4, linear_head_dim=64,
                 num_attention_heads=4, q_lora_rank=96, kv_lora_rank=64, qk_nope_head_dim=64,
                 v_head_dim=64, n_routed_experts=8, num_experts_per_tok=2,
-                moe_intermediate_size=128, intermediate_size=512)
+                moe_intermediate_size=128, intermediate_size=512,
+                index_n_heads=4, index_head_dim=32, index_topk=16)
     base.update(kw)
     return FlashCfg(**base)
 

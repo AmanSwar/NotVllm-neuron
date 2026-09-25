@@ -224,3 +224,30 @@ def test_conv_activation_is_linked_to_hidden_act():
     )
     x = torch.randn(64, generator=_g(12)) * 4.0
     torch.testing.assert_close(F.silu(x), x * torch.sigmoid(x), rtol=0, atol=1e-6)
+
+
+# ------------------------------------------------------------- suite portability
+def test_no_test_imports_a_toolchain_dependency():
+    """The suite runs anywhere with torch, and that is load-bearing rather than tidy.
+
+    External references are VENDORED (hf_refs, gdn_refs, indexer_refs) precisely so no
+    test needs transformers, vllm, nkilib or nki. transformers 5.17 lives in an
+    unrelated venv, vLLM ships manylinux wheels only, and nkilib's ``experimental/gdn``
+    is not even in the installed package on the dev box. A single ``import
+    transformers`` in one test would make the suite unrunnable for everyone.
+
+    This is a guard against a future regression, not a check of present behaviour --
+    the same species as the tiny_cfg clamp pin and the [c,c,K] source grep.
+    """
+    import re
+    banned = re.compile(r"^\s*(?:import|from)\s+(transformers|vllm|nkilib|nki)\b", re.M)
+    tests_dir = pathlib.Path(__file__).resolve().parent
+    offenders = []
+    for f in sorted(tests_dir.glob("*.py")):
+        for m in banned.finditer(f.read_text()):
+            offenders.append(f"{f.name}: {m.group(0).strip()}")
+    assert not offenders, (
+        "these imports break the suite everywhere the toolchain is absent; vendor the "
+        "reference instead, as hf_refs.py / gdn_refs.py / indexer_refs.py do:\n  "
+        + "\n  ".join(offenders)
+    )

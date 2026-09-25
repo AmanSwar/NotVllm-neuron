@@ -102,9 +102,34 @@ reference — which happened for exactly two areas, KDA and the indexer.
 | 28 | group masking (`n_group`) | omitted | tf masks by group | ✓ *only because* `n_group = 1` | **no** — unguarded |
 | 29 | `first_k_dense_replace` | `cfg` = 3 | config | ✓ | **no** |
 
-**Not audited:** `LinearAttention` wiring, `DecoderLayer`, `FlashTextModel`. I
-diffed rows 1–29 and did not reach the layer/model wiring. Recorded as unknown,
-not as matching.
+### Wiring — `LinearAttention`, `DecoderLayer`, `FlashTextModel`
+
+Audited 2026-09-25 (second pass; these were recorded as unknown in the first).
+**All match.** Recorded because a checked-and-clean row is not the same as an
+unchecked one, and that distinction is the point of this table.
+
+| # | Constant / choice | Oracle | Authority | agrees? | test? |
+|---|---|---|---|---|---|
+| 30 | qkv concat order | `cat([q_proj, k_proj, v_proj], -1)` | tf identical order | ✓ | **no** |
+| 31 | conv causal trim | `[..., -S:]` after the conv | tf `mixed_qkv[:, :, -seq_len:]` | ✓ | partial |
+| 32 | `forget_gate` input | the **layer input**, pre-conv | tf `self.forget_gate(hidden_states)` | ✓ | **no** |
+| 33 | output-gate path input | the **layer input**, pre-conv | tf `g_b_proj(g_a_proj(hidden_states))` | ✓ | **no** |
+| 34 | `l2norm` placement | inside the scan, on q and k | tf `use_qk_l2norm_in_kernel=True` | ✓ | partial |
+| 35 | final projection order | `o_proj(o_norm(core, gate))` | tf identical | ✓ | **no** |
+| 36 | layer order | `attn_hc` → `input_layernorm` → attn → expand → `ffn_hc` → `post_attention_layernorm` → mlp → expand | tf identical | ✓ | **no** |
+| 37 | `hc_expand` in the layer | `post·out + combᵀ·residual` | tf inlines the same expression | ✓ | **yes** (via mHC tests) |
+| 38 | stream initialisation | `h.unsqueeze(2).expand(-1,-1,hc_mult,-1).contiguous()` | tf byte-identical | ✓ | **no** |
+| 39 | final collapse order | `norm(streams.mean(2))` — **mean first** | tf `self.norm(self.hc_head(hidden_states))` | ✓ | **no** |
+
+Rows 32, 33, 38 and 39 are the ones worth noting: each is an ordering or
+input-selection choice that would produce plausible, wrong output if reversed, and
+none of them has a test.
+
+**Basis of this audit:** every row is a *source diff* against
+`modeling_glm5_next.py` and the live config, not a numerical comparison. The
+`agrees?` column says what the code says; the `test?` column says whether anything
+in the suite would notice if it changed. No row here is backed by a running test
+except where `test?` says yes.
 
 ---
 
@@ -167,8 +192,8 @@ Sorted by provenance, the diagnostic holds exactly:
 - **Written against an external reference** (indexer, mHC): rows 16–18 and the
   indexer — cross-checked, none wrong.
 - **Inherited verbatim from the NxDI port**: 1 confirmed bug (row 5), 1 found here
-  (row 24), 2 divergences (rows 3, 7, 21), 1 unguarded assumption (row 28), and
-  20 of 29 rows with no test that could disagree.
+  (row 24), 3 divergences (rows 3, 7, 21), 1 unguarded assumption (row 28), and
+  **28 of 39 rows with no test that could disagree**.
 
 `reference.py` says *"The math is unchanged from that CPU-verified version"*.
 "CPU-verified" in the NxDI fork meant its own tests passed — not that it had been
@@ -183,4 +208,5 @@ diffed against transformers. **Provenance is not verification.**
    `indexer_refs.py` already does, and **drive inputs hard enough to exercise
    clamps and saturation** or the tests inherit the blindness they remove.
 4. Row 28's assertion.
-5. Audit `LinearAttention` wiring, `DecoderLayer`, `FlashTextModel`.
+5. ~~Audit `LinearAttention` wiring, `DecoderLayer`, `FlashTextModel`.~~ Done —
+   rows 30-39, all match. But 8 of those 10 rows still have no test.

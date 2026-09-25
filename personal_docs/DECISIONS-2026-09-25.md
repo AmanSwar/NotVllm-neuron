@@ -129,6 +129,20 @@ TP=64 for three reasons, in order of weight:
   recommendation therefore sits at a hard boundary rather than in the middle of a range.
 - It is the only setting where BF16 weights leave real headroom: 10 GiB of 24 GiB.
 - The hardware is already a trn2.48xlarge; there is no saving from using less of it.
+- **A second, independent constraint points the same way** (dev2, from the KDA decode
+  kernel rather than from cache arithmetic). `gdn_tkg`'s SBUF envelope caps decode batch
+  size as a function of heads-per-rank, and heads split across TP ranks *before* LNC
+  sharding, so `heads_per_rank = 64 // TP`:
+
+  | TP | 1 | 2 | 4 | 8 | 64 |
+  |---|---|---|---|---|---|
+  | max decode batch | 2 | 5 | 10 | 20 | 166 |
+
+  Binding below TP=8; **at TP=64 it is not binding at all**. This matters because it is
+  arrived at from a different direction than the page-size argument, so high TP is not
+  resting on one line of reasoning. dev2 notes separately that `gdn_tkg`'s upstream test
+  table covers a single case (`bh=24`), so none of this envelope is verified upstream at
+  any TP.
 
 **One thing to check before committing**, which I have not: 288 routed experts do not
 divide 64 evenly (4.5 each). Whether that matters depends on the expert-parallel layout

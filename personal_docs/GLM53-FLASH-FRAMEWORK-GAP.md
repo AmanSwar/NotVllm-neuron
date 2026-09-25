@@ -405,9 +405,13 @@ power of two. **The `5 × 53` factor is TP-invariant**, because both terms scale
 in `1/TP`: no TP choice makes the state page divide a sane attention page, and
 `mamba_page_size_padded` is required at every TP. TP scales the magnitude only.
 
-The `24576 = 3 × 64 × 128` conv width is corroborated independently of vLLM's
-`kda_state_shape`: dev1's oracle declares `nn.Conv1d(3*H*K, ...)` and the weight
-converter finds exactly 34 three-source `{q,k,v}_conv1d` concatenations.
+The geometry these numbers rest on has **four independent sources**, which is worth
+recording because the whole TP argument depends on it: vLLM's `kda_state_shape` formula;
+dev1's oracle, which declares `nn.Conv1d(3*H*K, ..., groups=3*H*K)`; the weight
+converter, which finds exactly 34 three-source `{q,k,v}_conv1d` concatenations; and
+nkilib's own kernel contract — `gdn_tkg` takes `state_in [BH, K, V]` with
+`BH = B × num_v_heads` and asserts that shape, with `head_dim ≤ 128` satisfied at exactly
+128 (dev2, confirmed positively rather than by silence).
 
 PR #54 quotes the identical value, 271,360, for **Qwen3.5's DeltaNet page at TP=4**. That
 is a different model at a different TP degree — a coincidence of value, not a measurement

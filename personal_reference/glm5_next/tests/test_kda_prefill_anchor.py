@@ -64,6 +64,18 @@ def max_safe_subblock(gate_lower_bound, dtype=torch.float32):
     return int(math.log(torch.finfo(dtype).max) / abs(gate_lower_bound))
 
 
+def max_safe_pow2_subblock(gate_lower_bound, dtype=torch.float32):
+    """The size a kernel can actually use: the largest POWER OF TWO under the bound.
+
+    This is the number that matters, and it moves in jumps. At
+    ``gate_lower_bound = -5.0`` the bound is 17 and the usable size is 16. At -6.0 the
+    bound is 14 -- which reads like a small adjustment -- but the usable size **halves
+    to 8**, which is a different tiling, not a tweak.
+    """
+    n = max_safe_subblock(gate_lower_bound, dtype)
+    return 1 << (n.bit_length() - 1)
+
+
 def _inputs(seed=0, decay="real", B=1, Hh=2, T=CHUNK):
     g_ = torch.Generator().manual_seed(seed)
     r = lambda *s: torch.randn(*s, generator=g_)
@@ -175,11 +187,17 @@ def test_the_bound_is_derived_from_gate_lower_bound():
     assert max_safe_subblock(cfg.linear_lower_bound, torch.bfloat16) == 17, (
         "fp32 and bf16 share an exponent range, so the bound is the same"
     )
-    # the bound moves with the config, which is the point
+    # The bound moves with the config, and the USABLE size moves in jumps.
     assert max_safe_subblock(-6.0) == 14 and max_safe_subblock(-4.0) == 22
+    assert max_safe_pow2_subblock(-5.0) == 16
+    assert max_safe_pow2_subblock(-6.0) == 8, (
+        "gate_lower_bound -6.0 does not shave the sub-block from 16 to 14 -- it HALVES "
+        "it to 8, because only powers of two are usable. A config change here is a "
+        "re-tiling of the kernel, not a constant adjustment."
+    )
+    assert max_safe_pow2_subblock(-4.0) == 16
     chosen = 16
-    assert chosen <= max_safe_subblock(cfg.linear_lower_bound)
-    assert chosen * 2 > max_safe_subblock(cfg.linear_lower_bound), "16 is the largest safe power of two"
+    assert chosen == max_safe_pow2_subblock(cfg.linear_lower_bound)
 
 
 @pytest.mark.parametrize("decay", ["real", "adversarial"])
@@ -212,3 +230,132 @@ def test_non_dividing_subblock_is_rejected():
     k, beta, g = _inputs()
     with pytest.raises(AssertionError, match="must divide"):
         anchored_operator(k, beta, g, 17)
+
+
+# ===================================================== the whole prefill, anchored
+# chunk_kda uses the [B,H,C,c,c,K] `decay` tensor in exactly TWO places -- the A
+# operator and the intra-chunk output -- and both are the same bilinear form:
+#
+#     out[i,j] = sum_d  X[i,d] * Y[j,d] * exp(cg[i,d] - cg[j,d])
+#
+# So one anchored helper serves both, and NOTHING ELSE in chunk_kda needs a
+# [c,c,K] intermediate. Everything else is elementwise or a plain matmul, and the
+# per-channel gate lands on the partition axis where it is free.
+#
+# The other exp() uses are all <= 1 and underflow benignly: exp(cg) in `inter` and
+# `k_cumdecay` (a fully decayed state contributes nothing), exp(cg_last - cg) in the
+# state update, exp(cg_last) in the state decay. Only the anchored column factor
+# grows, which is what BC bounds.
+
+def anchored_bilinear(X, Y, cg, BC):
+    """``out[i,j] = sum_d X[i,d] Y[j,d] exp(cg[i,d]-cg[j,d])`` as plain block matmuls.
+
+    X, Y, cg: ``[..., c, K]``. Returns ``[..., c, c]``, lower-triangle region valid.
+    """
+    c = X.shape[-2]
+    assert c % BC == 0, f"BC={BC} must divide chunk={c}; a remainder is dropped"
+    out = X.new_zeros(*X.shape[:-2], c, c)
+    for bi in range(c // BC):
+        n = bi * BC
+        anchor = cg[..., n : n + 1, :]
+        rows = slice(n, n + BC)
+        xs = X[..., rows, :] * (cg[..., rows, :] - anchor).exp()        # <= 1
+        for bj in range(bi + 1):
+            cols = slice(bj * BC, bj * BC + BC)
+            ys = Y[..., cols, :] * (anchor - cg[..., cols, :]).exp()    # >= 1 on diagonal
+            out[..., rows, cols] = xs @ ys.transpose(-1, -2)
+    return out
+
+
+def chunk_kda_anchored(q, k, v, g, beta, state=None, chunk=CHUNK, BC=16):
+    """``reference.chunk_kda`` with every ``[c,c,K]`` intermediate removed.
+
+    Structurally identical otherwise, so the diff against ``chunk_kda`` is exactly the
+    part a NKI prefill kernel has to do differently. Validated against it below.
+    """
+    import torch.nn.functional as F
+    dt = q.dtype
+    q, k, v, beta, g = [t.transpose(1, 2).contiguous().float() for t in (q, k, v, beta, g)]
+    q, k = R.l2norm(q), R.l2norm(k)
+    B, Hh, T, Kd = k.shape
+    V = v.shape[-1]
+    pad = (chunk - T % chunk) % chunk
+    Tp = T + pad
+    q = F.pad(q, (0, 0, 0, pad)) * (Kd ** -0.5)
+    k, v = F.pad(k, (0, 0, 0, pad)), F.pad(v, (0, 0, 0, pad))
+    g, beta = F.pad(g, (0, 0, 0, pad)), F.pad(beta, (0, pad))
+    v_beta, k_beta = v * beta[..., None], k * beta[..., None]
+    rs = lambda t: t.reshape(B, Hh, -1, chunk, t.shape[-1])
+    q, k, v, g, k_beta, v_beta = map(rs, (q, k, v, g, k_beta, v_beta))
+    g = g.cumsum(-2)
+    tri = torch.triu(torch.ones(chunk, chunk, dtype=torch.bool), 0)
+    stri = torch.triu(torch.ones(chunk, chunk, dtype=torch.bool), 1)
+
+    # THE CHANGE: A via anchored blocks instead of the [c,c,K] decay tensor.
+    attn = -anchored_bilinear(k_beta, k, g, BC).masked_fill(tri, 0)
+    for i in range(1, chunk):
+        row, sub = attn[..., i, :i].clone(), attn[..., :i, :i].clone()
+        attn[..., i, :i] = row + (row.unsqueeze(-1) * sub).sum(-2)
+    attn = attn + torch.eye(chunk)
+    v = attn @ v_beta
+    k_cumdecay = attn @ (k_beta * g.exp())
+
+    S = torch.zeros(B, Hh, Kd, V) if state is None else state.float()
+    out = torch.zeros_like(v)
+    for i in range(Tp // chunk):
+        q_i, k_i, v_i, g_i = q[:, :, i], k[:, :, i], v[:, :, i], g[:, :, i]
+        inter = (q_i * g_i.exp()) @ S
+        # THE CHANGE, second site: intra output via anchored blocks.
+        intra = anchored_bilinear(q_i, k_i, g_i, BC).masked_fill(stri, 0)
+        v_new = v_i - k_cumdecay[:, :, i] @ S
+        out[:, :, i] = inter + intra @ v_new
+        S = S * g_i[:, :, -1].exp().unsqueeze(-1) + (k_i * (g_i[:, :, -1:] - g_i).exp()).transpose(-1, -2) @ v_new
+    out = out.reshape(B, Hh, -1, V)[:, :, :T].transpose(1, 2).contiguous().to(dt)
+    return out, S
+
+
+def _prefill_inputs(T, seed=0, B=1, Hh=2, decay="real"):
+    g_ = torch.Generator().manual_seed(seed)
+    r = lambda *s: torch.randn(*s, generator=g_)
+    q, k, v = r(B, T, Hh, K), r(B, T, Hh, K), r(B, T, Hh, K)
+    g = -5.0 * torch.sigmoid(r(B, T, Hh, K)) if decay == "real" else \
+        torch.empty(B, T, Hh, K).uniform_(0.95, 1.0, generator=g_).log()
+    beta = torch.sigmoid(r(B, T, Hh))
+    return q, k, v, g, beta, r(B, Hh, K, K) * 0.1
+
+
+@pytest.mark.parametrize("T", [64, 128, 192])
+@pytest.mark.parametrize("decay", ["real", "long"])
+def test_anchored_prefill_matches_chunk_kda(T, decay):
+    """The whole prefill path, with no [c,c,K] intermediate anywhere, must reproduce
+    chunk_kda. Multiple chunks, so the inter-chunk state carry is exercised too."""
+    q, k, v, g, beta, s0 = _prefill_inputs(T, decay=decay)
+    ref_o, ref_s = R.chunk_kda(q, k, v, g, beta, s0.clone(), chunk=CHUNK)
+    got_o, got_s = chunk_kda_anchored(q, k, v, g, beta, s0.clone(), chunk=CHUNK, BC=16)
+    assert ref_o.abs().max() > 1e-3, "output ~zero; comparison would be vacuous"
+    rel_o = (got_o - ref_o).abs().max().item() / ref_o.abs().max().item()
+    rel_s = (got_s - ref_s).abs().max().item() / ref_s.abs().max().item()
+    assert rel_o < 1e-5, f"T={T} {decay}: output relative {rel_o:.2e}"
+    assert rel_s < 1e-5, f"T={T} {decay}: state relative {rel_s:.2e}"
+
+
+@pytest.mark.parametrize("BC", [4, 8, 16])
+def test_anchored_prefill_is_subblock_size_invariant(BC):
+    """BC is a numerical-range choice, not a modelling one: every safe BC gives the
+    same answer. If a future BC changed the result, the factorisation would be wrong."""
+    q, k, v, g, beta, s0 = _prefill_inputs(128, seed=4)
+    ref_o, _ = R.chunk_kda(q, k, v, g, beta, s0.clone(), chunk=CHUNK)
+    got_o, _ = chunk_kda_anchored(q, k, v, g, beta, s0.clone(), chunk=CHUNK, BC=BC)
+    assert (got_o - ref_o).abs().max().item() / ref_o.abs().max().item() < 1e-5
+
+
+def test_anchored_prefill_never_builds_a_chunk_chunk_k_tensor():
+    """The whole point. Guards against a 'simplification' that reintroduces the 2 MB
+    intermediate -- which would still pass every numerical test above."""
+    import inspect
+    src = inspect.getsource(anchored_bilinear) + inspect.getsource(chunk_kda_anchored)
+    for banned in ("unsqueeze(-3)", "unsqueeze(-2) *"):
+        assert banned not in src, (
+            f"{banned!r} is the [c,c,K] broadcast pattern this factorisation exists to "
+            f"avoid; it reintroduces a 64x64x128 intermediate per chunk per head"
+        )

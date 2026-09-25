@@ -36,25 +36,30 @@ that a weak test cannot tell them apart.
 Scope and validity ceiling
 --------------------------
 Text decoder only. The 11 sparse-MLA layers run DENSE causal attention with no
-indexer, which is **exact for seq_len <= 2048 and wrong above it** — not
+indexer, which is **exact for seq_len <= 2051 and wrong above it** — not
 approximate above it: the oracle attends to tokens the model's indexer excludes.
 
-Verified 2026-09-25 against vLLM's implementation, not by re-deriving the pool
-arithmetic. The question that mattered was whether ``index_kpool_compress`` means
-attention runs over compressed pool representatives (which would make selecting
-every pool still lossy). It does not: vLLM keeps the compressed entries in a
-separate ``Glm5NextIndexerCache`` used only for scoring, keeps the in-progress
-pool's **raw** K in ``Glm5NextTailCache``, and has attention gather full-fidelity
-tokens by the token indices the indexer emits. vLLM then takes this very shortcut
-itself — "Short sequences select every pool, so skip sparse scoring and fill the
-top-k buffer with all causal token indices" for prefill, and
-``_fill_short_decode_causal_indices`` for decode — both gated on
-``seq_len <= topk_tokens`` where ``topk_tokens = config.index_topk = 2048``.
+2051 is ``index_topk + index_kpool - 1``. The indexer scores only the
+``L // index_kpool`` *complete* pools, selects ``index_topk // index_kpool`` of
+them, and ``index_kpool_always_select_tail`` appends the ``L % index_kpool``
+tokens of the incomplete pool raw, so every token is covered while
+``L // 4 <= 512``. vLLM's own short-sequence gate is ``seq_len <= index_topk``
+(2048): correct, but conservative, not the ceiling. An earlier version of this
+docstring said 2048, from counting ``ceil(L / 4)`` pools, which wrongly treats the
+incomplete pool as a scoring candidate.
+
+Verified 2026-09-25 against vLLM's implementation and transformers 5.17's
+``Glm5NextTextIndexer``. The question that mattered was whether
+``index_kpool_compress`` means attention runs over compressed pool representatives
+(which would make selecting every pool still lossy). It does not: vLLM keeps the
+compressed entries in a separate ``Glm5NextIndexerCache`` used only for scoring,
+keeps the in-progress pool's **raw** K in ``Glm5NextTailCache``, and has attention
+gather full-fidelity tokens by the token indices the indexer emits.
 
 ``tests/test_dense_mla_exactness.py`` pins the five things this depends on, so a
 config change trips a test rather than silently invalidating the oracle.
 
-**Milestone 2 targets 1M context; this oracle reaches 2048.** Validating anything
+**Milestone 2 targets 1M context; this oracle reaches 2051.** Validating anything
 longer needs a real indexer here.
 """
 from __future__ import annotations
@@ -281,7 +286,7 @@ class LinearAttention(nn.Module):
 
 # --------------------------------------------------------------------------- NoPE MLA
 class SparseMLAttention(nn.Module):
-    """DeepSeek-V3 MLA with qk_rope_head_dim=0 (NoPE). Dense causal attention == DSA for seq<=2048 (see module docstring)."""
+    """DeepSeek-V3 MLA with qk_rope_head_dim=0 (NoPE). Dense causal attention == DSA for seq<=2051 (see module docstring)."""
     def __init__(self, cfg: FlashCfg):
         super().__init__()
         D, Hh = cfg.hidden_size, cfg.num_attention_heads

@@ -127,11 +127,27 @@ dynamic slicing, no graph breaks. Every conditional branch becomes its own NEFF.
 After warmup `fail_on_recompile` is armed, so an uncovered shape is a **hard
 failure**, not a slow path.
 
-### 3.2 `head_dim` is capped at 128
+### 3.2 `head_dim` is capped at 128 — **in prefill only**
 
 `MAX_HEAD_DIM = 128` in `vllm_neuron/functional/attention/attention_cte.py` and
 `_MAX_HEAD_DIM = 128` in `attention_segmented_cte.py`. This is `P_MAX`, the SBUF
 partition dimension — a hardware property, not a software limit.
+
+**Both of those files are `*_cte` — context encoding, i.e. prefill. The cap does
+not apply to decode.** Established by dev3 from `nkilib` source and verified
+independently here on 2026-09-25:
+
+- `MAX_HEAD_DIM` appears **nowhere** outside those two prefill files.
+- `attention_decode.py` has no head-dim ceiling at all. Its eligibility guard
+  `_can_use_attention_block_kernel` (line 1211) rejects only an **odd** `d_head`
+  (line 1255, `if d_head % 2 != 0`).
+- `nkilib/core/attention/attention_tkg.py:52` sets `_MAX_D_HEAD = 512`, asserted
+  at line 1222 as `0 < cfg.d_head <= _MAX_D_HEAD`. TKG is token generation, i.e.
+  decode.
+
+So a model with `head_dim` in (128, 512] loses the fused kernel on **prefill**
+and keeps it on **decode**. That is a much narrower problem than "falls off the
+fused attention path entirely", which is what this section used to say.
 
 Models above it fall off the fused attention path entirely. PR #40 (MiMo-V2.5,
 192-wide Q/K) had to run **eager attention with fp32 scores**. The NxDI Qwen3.5
@@ -149,7 +165,9 @@ in fp32 (`q.float() @ k.float().transpose(-1, -2)` then `torch.softmax`), so
 of the eager path at 6–8% of prefill, i.e. a **performance** item, not a
 correctness gate.
 
-Still live for **MiMo-V2.6-Pro** (192), which has no such port yet.
+Still relevant to **MiMo-V2.6-Pro** (192), which has no such port yet — but per
+the above, only on its prefill path. Its decode would keep the fused kernel,
+since 192 is well inside `_MAX_D_HEAD = 512`.
 
 ### 3.3 No recurrent-state cache (as of this fork point)
 

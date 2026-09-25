@@ -34,28 +34,14 @@ import torch
 import torch.nn.functional as F
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2]))
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from glm5_next import reference as R  # noqa: E402
+import hf_refs as H  # noqa: E402
+
+_hf_mlp_forward = H.hf_mlp   # the transformers reference lives in hf_refs.py
 
 LIMIT = 10.0
 D, I = 256, 512
-
-
-def _hf_mlp_forward(x, gate_w, up_w, down_w, swiglu_limit):
-    """transformers 5.17 ``Glm5NextTextMLP.forward``, verbatim apart from taking
-    weights as arguments and ``act_fn`` spelled out (config.hidden_act == "silu").
-
-        gate = self.gate_proj(x)
-        up = self.up_proj(x)
-        # Key difference using clamping
-        gate = gate.clamp(min=None, max=self.swiglu_limit)
-        up = up.clamp(min=-self.swiglu_limit, max=self.swiglu_limit)
-        return self.down_proj(self.act_fn(gate) * up)
-    """
-    gate = F.linear(x, gate_w)
-    up = F.linear(x, up_w)
-    gate = gate.clamp(min=None, max=swiglu_limit)
-    up = up.clamp(min=-swiglu_limit, max=swiglu_limit)
-    return F.linear(F.silu(gate) * up, down_w)
 
 
 def _unclamped_forward(x, gate_w, up_w, down_w):

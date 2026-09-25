@@ -1,174 +1,186 @@
-# GLM-5.3-Flash oracle — provenance audit
+# GLM-5.3-Flash oracle — audit by constant
 
 dev1, 2026-09-25. Branch `oracle-provenance-audit` off `dev`.
 
 Audit only — **no fixes made here.** The oracle lives on `glm53-indexer`, which
 dev2 owns; this branch carries the finding, not the change.
 
-Prompted by the KDA output-gate bug (silu where both references say sigmoid,
-fixed in `b50f62d`), and by dev2's observation that the blindness tracked
-**provenance** rather than effort: the newest component (the indexer) was
-cross-referenced against two independent implementations and was never wrong; the
-oldest material, inherited verbatim from the NxDI port, was.
+## Why this is a table of constants, not of components
 
-The question asked of every component: **is there an external oracle for this
-value, or only internal consistency?**
+The KDA output-gate bug is the worked example, and it disqualifies component-level
+auditing:
 
----
+> `RMSNormGated` had an external oracle available the whole time. transformers
+> implements it (`Glm5NextTextRMSNormGated`, with `self.activation = "sigmoid"`
+> spelled out on its own line) and so does vLLM. The component was never
+> unreferenced. It was wrong because **no test was ever pointed at that one
+> value**.
+>
+> Worse, the suite *looked* covered: `test_gate_is_per_channel_not_scalar` has a
+> 159,436x discriminating margin and passes. But it discriminates the **decay**
+> gate — `ForgetGate`'s per-channel `exp(g)` — while the thing that was wrong was
+> the **output** gate, `o_norm`'s activation. Different gate, similar name.
+>
+> **A component-level audit would have scored `RMSNormGated` green.**
 
-## The headline: there are no known-unknowns
+So the question asked below is per constant and per activation choice: *is there a
+test whose two sides could disagree about this specific value?* Credit to dev2 for
+the reframing.
 
-**`transformers` 5.17.0 ships `models/glm5_next/modeling_glm5_next.py`** (2,426
-lines) with a **one-to-one counterpart for every component of the oracle**:
+## Method
 
-| oracle | transformers |
-|---|---|
-| `RMSNorm` / `UnweightedRMSNorm` / `RMSNormGated` | `Glm5NextTextRMSNorm` / `…UnweightedRMSNorm` / `…RMSNormGated` |
-| `HyperConnection` / `hc_expand` | `Glm5NextTextHyperConnection` |
-| `streams.mean(2)` | `Glm5NextTextHyperHead` |
-| `ForgetGate` | `Glm5NextTextForgetGate` |
-| `recurrent_kda` / `chunk_kda` | `recurrent_kimi_delta_attention` / `chunk_kimi_delta_attention` |
-| `LinearAttention` | `Glm5NextTextLinearAttention` |
-| `Indexer` | `Glm5NextTextIndexer` |
-| `SparseMLAttention` | `Glm5NextTextAttention` |
-| `MLP` | `Glm5NextTextMLP` |
-| `TopkRouter` / `MoE` | `Glm5NextTextTopkRouter` / `…MoE` / `…Experts` |
-| `DecoderLayer` / `FlashTextModel` | `Glm5NextTextDecoderLayer` / `…TextModel` |
+Every row diffed against `transformers` 5.17.0
+`models/glm5_next/modeling_glm5_next.py` (2,426 lines), which ships a one-to-one
+counterpart for every component of the oracle, and against the live
+`zai-org/GLM-5.3-Flash` `config.json`. "Test could disagree?" is judged against
+the suite as it stands on `glm53-indexer`.
 
-So every gap below is a **cheap-test gap**, not a known-unknown. Nothing here
-needs a reference that does not exist; it needs someone to use the one that does.
+One structural note: **no test imports transformers.** The oracle is deliberately
+transformers-free, so external references are *vendored* (`tests/gdn_refs.py` from
+nkilib, `tests/indexer_refs.py` from transformers + vLLM). That is a sound design,
+but it means external coverage exists only where someone explicitly vendored a
+reference — which happened for exactly two areas, KDA and the indexer.
 
 ---
 
 ## The table
 
-"Checked" = I diffed it against `modeling_glm5_next.py` during this audit.
-"Distinguishing test?" = would the suite **as it stands** fail if this component
-were wrong.
+`agrees?` ✓ = matches transformers. ✗ = does not.
+`test?` = would the suite **as it stands** fail if this value were wrong.
 
-| # | Component | Provenance | External reference | Cross-referenced before this audit | Distinguishing test? | Verdict |
-|---|---|---|---|---|---|---|
-| 1 | `MLP` (dense + `shared_experts`) | NxDI, verbatim | `Glm5NextTextMLP` | no | **no — and a naive one would not either** | **BUG — no swiglu clamp** |
-| 2 | `SparseMLAttention` | NxDI, verbatim | `Glm5NextTextAttention` | no | no | **divergence — softmax dtype** |
-| 3 | `RMSNorm` | NxDI, verbatim | `Glm5NextTextRMSNorm` | no | no | **divergence — cast order** |
-| 4 | `TopkRouter` | NxDI, verbatim | `Glm5NextTextTopkRouter` | no | no | correct, but on an **unguarded config assumption** |
-| 5 | `ForgetGate` | NxDI, verbatim | `Glm5NextTextForgetGate` | no | no | matches |
-| 6 | `MoE` expert path | NxDI, verbatim | `Glm5NextTextExperts` | no | no | matches |
-| 7 | `UnweightedRMSNorm` | NxDI, verbatim | `…UnweightedRMSNorm` | no | no | matches |
-| 8 | HyperHead (`streams.mean(2)`) | NxDI, verbatim | `Glm5NextTextHyperHead` | no | no | matches |
-| 9 | `l2norm` | NxDI, verbatim | `l2norm` | no | no | matches (textually identical) |
-| 10 | `RMSNormGated` | NxDI, verbatim | `…RMSNormGated` | **now yes** (dev2) | yes | was **WRONG**, fixed `b50f62d` |
-| 11 | `HyperConnection` / `hc_expand` | NxDI, verbatim | vLLM `kernels/mhc/torch.py` | yes (vs vLLM) | yes | matches, 0.0–9.5e-7 |
-| 12 | `Indexer` | dev2, new | `Glm5NextTextIndexer` + vLLM | yes (both) | yes | matches |
-| 13 | `recurrent_kda` / `chunk_kda` | NxDI, verbatim | `*_kimi_delta_attention` | partly (dev2 vs nkilib GDN ref) | yes | matches |
-| 14 | `LinearAttention` wiring | NxDI, verbatim | `…TextLinearAttention` | no | **not checked in this audit** | unknown |
-| 15 | `DecoderLayer` / `FlashTextModel` | NxDI, verbatim | `…DecoderLayer` / `…TextModel` | no | **not checked in this audit** | unknown |
+### Norms and activations
 
-Rows 14–15 are honest gaps in *this audit*, not established matches. I compared
-rows 1–9 line by line and did not get to the layer/model wiring.
+| # | Constant / choice | Oracle | Authority | agrees? | test? |
+|---|---|---|---|---|---|
+| 1 | `rms_norm_eps` | `cfg.rms_norm_eps` = 1e-5 | config; tf same | ✓ | **no** |
+| 2 | RMSNorm scale form | plain `weight` | tf plain `weight` | ✓ | **no** — and this is a Qwen trap: Qwen3.5 uses `(1 + weight)` |
+| 3 | RMSNorm cast order | `(w · x_fp32).to(dt)` | tf `w * x.to(input_dtype)` | **✗** | **no** |
+| 4 | `UnweightedRMSNorm` eps | `cfg.rms_norm_eps` | tf passes `config.rms_norm_eps` too | ✓ | **no** |
+| 5 | `RMSNormGated` activation | `sigmoid` | tf `self.activation = "sigmoid"` | ✓ **now** | **yes** (dev2, `b50f62d`) — was `silu` |
+| 6 | `o_norm` eps | `cfg.rms_norm_eps` | tf `layer_norm_epsilon` | ✓ | **no** |
+| 7 | `l2norm` form | `x * rsqrt(Σ + eps)` | tf `x / sqrt(Σ + eps)` — *"intentionally use sqrt and / to match original triton"* | **✗** | **no** |
+| 8 | `l2norm` eps | 1e-6 | tf 1e-6 | ✓ | **no** |
+| 9 | conv activation | hardcoded `F.silu` | tf `config.hidden_act` (= `"silu"`) | ✓ value, hardcoded | **no** |
+
+### KDA
+
+| # | Constant / choice | Oracle | Authority | agrees? | test? |
+|---|---|---|---|---|---|
+| 10 | `beta` | `sigmoid(b_proj(x))` | tf same | ✓ | partial (`gdn_refs`) |
+| 11 | `gate_lower_bound` | `cfg` = −5.0 | config; tf same | ✓ | partial |
+| 12 | ForgetGate activation | `lower · sigmoid(decay · g)` | tf same | ✓ | partial |
+| 13 | softplus branch threshold | 20.0 | tf 20.0 | ✓ | **no** |
+| 14 | gate is **per channel** `[B,S,H,K]` | yes | tf same | ✓ | **yes** |
+| 15 | recurrence / chunked scan | — | nkilib GDN torch ref | ✓ | **yes** (dev2) |
+
+### mHC
+
+| # | Constant / choice | Oracle | Authority | agrees? | test? |
+|---|---|---|---|---|---|
+| 16 | `hc_mult` 4 / `hc_sinkhorn_iters` 20 / `hc_eps` 1e-6 | from cfg | config; vLLM | ✓ | **yes** |
+| 17 | post multiplier | hardcoded `2 *` | vLLM `mhc_post_mult_value = 2.0` | ✓ | **yes** |
+| 18 | mix width | `(2 + H) · H` | vLLM `mix_hc = (2 + n) · n` | ✓ | **yes** |
+| 19 | HyperHead collapse | `streams.mean(2)` | tf `Glm5NextTextHyperHead` — unweighted mean | ✓ | **no** |
+
+### Sparse-MLA
+
+| # | Constant / choice | Oracle | Authority | agrees? | test? |
+|---|---|---|---|---|---|
+| 20 | attention scale | `qk_head_dim ** -0.5` | tf identical (`qk_rope = 0`, so 256) | ✓ | **no** |
+| 21 | softmax dtype | ambient (bf16) | tf forces `dtype=torch.float32` | **✗** | **no** |
+| 22 | latent slice / NoPE | `[..., :kv_lora_rank]`, no RoPE | config `qk_rope_head_dim = 0` | ✓ | **no** |
+
+### MoE and MLP
+
+| # | Constant / choice | Oracle | Authority | agrees? | test? |
+|---|---|---|---|---|---|
+| 23 | `swiglu_limit` in routed experts | 10.0, clamped | tf `_apply_gate` identical | ✓ | **no** |
+| 24 | `swiglu_limit` in `MLP` | **absent** | tf `Glm5NextTextMLP` clamps | **✗ BUG** | **no — and a naive external test would also pass** |
+| 25 | `routed_scaling_factor` | `cfg` = 2.5 | config; tf same | ✓ | **no** |
+| 26 | top-k norm denominator | `+ 1e-20` | tf `+ 1e-20` | ✓ | **no** |
+| 27 | scoring function | `sigmoid` | config `scoring_func: sigmoid` | ✓ | **no** |
+| 28 | group masking (`n_group`) | omitted | tf masks by group | ✓ *only because* `n_group = 1` | **no** — unguarded |
+| 29 | `first_k_dense_replace` | `cfg` = 3 | config | ✓ | **no** |
+
+**Not audited:** `LinearAttention` wiring, `DecoderLayer`, `FlashTextModel`. I
+diffed rows 1–29 and did not reach the layer/model wiring. Recorded as unknown,
+not as matching.
 
 ---
 
-## Finding 1 — `MLP` omits the swiglu clamp (a real bug)
+## The four findings, in order of severity
+
+### 1. `MLP` omits the swiglu clamp — a real bug on 45 of 45 layers
 
 ```python
 # oracle
-def forward(self, x):
-    return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
-
+return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
 # transformers — the comment is theirs
 gate = gate.clamp(min=None, max=self.swiglu_limit)          # 10.0
 up   = up.clamp(min=-self.swiglu_limit, max=self.swiglu_limit)
-return self.down_proj(self.act_fn(gate) * up)
 ```
 
-**Blast radius is larger than "the three dense layers".** `MLP` is used at:
+`MLP` is used at layers 0–2 (`first_k_dense_replace = 3`) **and as
+`MoE.shared_experts` on all 42 MoE layers**, so the shared expert runs unclamped
+everywhere. The routed experts *are* clamped and match exactly — the same
+one-place-not-the-other shape as the gate bug.
 
-- layers 0, 1, 2 (`first_k_dense_replace = 3`), and
-- **`MoE.shared_experts` on all 42 MoE layers** — `self.shared_experts = MLP(...)`.
+**And an external test would also have missed it.** The clamp is a no-op until
+activations exceed ±10:
 
-So the shared expert runs unclamped on every MoE layer. The routed experts *are*
-clamped (`MoE.forward` does it inline and matches `Glm5NextTextExperts._apply_gate`
-exactly), which is the same one-place-not-the-other pattern as the silu/sigmoid
-bug.
+| gate/up std | fraction clamped | mean rel. diff |
+|---|---|---|
+| 1.0 | 0.000 | 0.00e+00 |
+| 3.0 | 0.002 | 8.8e-05 |
+| 5.0 | 0.089 | 9.7e-03 |
+| 8.0 | 0.378 | 7.5e-02 |
 
-### Why an external test would *also* have missed it unless deliberately scaled
+`tiny_cfg` initialises at `normal_(0, 0.02)`, keeping activations far inside the
+limit, so comparing `MLP` against `Glm5NextTextMLP` on those weights **passes with
+the bug present**. This row needs an external oracle *and* inputs driven past the
+limit. An external reference is necessary but not sufficient.
 
-The clamp is a no-op until activations exceed ±10. Measured:
+### 2. `l2norm` uses the Qwen form (row 7)
 
-| gate/up std | fraction clamped | mean rel. diff | max rel. diff |
-|---|---|---|---|
-| 1.0 | 0.000 | 0.00e+00 | 0.00e+00 |
-| 3.0 | 0.002 | 8.8e-05 | 4.0e-01 |
-| 5.0 | 0.089 | 9.7e-03 | 7.7e-01 |
-| 8.0 | 0.378 | 7.5e-02 | 8.8e-01 |
+transformers computes `x / sqrt(Σ + eps)` and comments *"main difference to qwen's
+gdn variation: intentionally use sqrt and / to match original triton"*. The oracle
+uses `x * rsqrt(Σ + eps)` — precisely the Qwen variant transformers is warning
+about. ULP-level, but transformers considered it worth pinning, and this is the
+**third** Qwen→GLM carry-over after the output gate and the 2051 ceiling.
 
-`tiny_cfg` initialises weights at `normal_(0, 0.02)`, which keeps activations far
-inside the limit. **A test that compared `MLP` against `Glm5NextTextMLP` on those
-weights would pass with the bug present.** This one needs an external oracle *and*
-inputs driven past the limit — the sharper form of the lesson.
+### 3. Softmax and cast-order divergences (rows 3, 21)
 
-## Finding 2 — `SparseMLAttention` does not force fp32 softmax
+Sparse-MLA does not force fp32 softmax where transformers does; `RMSNorm` casts in
+the other order. Both are precision divergences invisible to self-consistency.
 
-transformers (`eager_attention_forward`, line 1059):
+### 4. `n_group` is an unguarded assumption (row 28)
 
-```python
-attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)
-```
-
-The oracle does `att.masked_fill(~mask, -inf).softmax(-1)` in the ambient dtype.
-`scaling` matches exactly (`qk_head_dim ** -0.5`, and `qk_rope_head_dim = 0` so
-`qk_head_dim = qk_nope_head_dim = 256`), and the LoRA/latent structure matches.
-This is a precision divergence, not a structural one — but it is exactly the kind
-a self-consistency test cannot see.
-
-## Finding 3 — `RMSNorm` cast ordering
-
-| | expression |
-|---|---|
-| transformers | `self.weight * hidden_states.to(input_dtype)` — cast **then** multiply |
-| oracle | `(self.weight * (xf * rsqrt(...))).to(x.dtype)` — multiply in fp32 **then** cast |
-
-Also differs in returned dtype (transformers returns the weight's dtype, the
-oracle the input's). Both use plain `weight`, **not** `(1 + weight)` — worth
-noting because Qwen3.5 uses `(1 + weight)` and that is precisely the kind of
-sibling-model fact that has already caused two bugs here.
-
-## Finding 4 — `TopkRouter`'s group logic is omitted on an unguarded assumption
-
-transformers masks experts by group before the top-k; the oracle skips that
-entirely. With `n_group = 1` and `topk_group = 1` — both verified in the live
-config — the group logic is provably the identity, so the oracle is **correct**,
-and its docstring says so.
-
-But nothing asserts it. If `n_group` ever changed, the oracle would silently
-route differently. A one-line assertion would convert a correct-by-luck into a
-correct-by-construction.
+Correct today and the docstring says why, but nothing asserts `n_group == 1`. One
+assertion converts correct-by-luck into correct-by-construction.
 
 ---
 
 ## What the pattern says
 
-Ordering the table by provenance reproduces dev2's observation exactly:
+Sorted by provenance, the diagnostic holds exactly:
 
-- **Newest, written against external references** (indexer, mHC): cross-checked,
-  never wrong.
-- **Inherited verbatim from the NxDI port**: 1 confirmed bug (`RMSNormGated`),
-  1 more found here (`MLP`), 2 divergences, 1 unguarded assumption, and 2
-  components nobody has looked at.
+- **Written against an external reference** (indexer, mHC): rows 16–18 and the
+  indexer — cross-checked, none wrong.
+- **Inherited verbatim from the NxDI port**: 1 confirmed bug (row 5), 1 found here
+  (row 24), 2 divergences (rows 3, 7, 21), 1 unguarded assumption (row 28), and
+  20 of 29 rows with no test that could disagree.
 
-The `reference.py` docstring says *"The math is unchanged from that CPU-verified
-version"* — which is what made this feel safe. "CPU-verified" in the NxDI fork
-meant its own tests passed, not that it had been diffed against transformers.
-**Provenance is not verification.**
+`reference.py` says *"The math is unchanged from that CPU-verified version"*.
+"CPU-verified" in the NxDI fork meant its own tests passed — not that it had been
+diffed against transformers. **Provenance is not verification.**
 
-## Suggested order of work (for whoever owns the oracle)
+## Suggested order of work
 
-1. `MLP` clamp — a real bug on 45 of 45 layers, with a known blast radius.
-2. Add the missing external-reference tests for rows 1–9. They are cheap: import
-   `transformers.models.glm5_next.modeling_glm5_next`, build both, compare.
-   **Drive the inputs hard enough to exercise clamps and saturation**, or the
-   tests inherit the blindness they are meant to remove.
-3. Rows 14–15 (`LinearAttention` wiring, `DecoderLayer`/`FlashTextModel`) —
-   unaudited; someone should diff them.
-4. The `n_group` assertion.
+1. Row 24, the `MLP` clamp — a real bug with a known blast radius.
+2. Rows 7, 3, 21 — decide whether to match transformers exactly or record the
+   divergence deliberately. Either is defensible; silently differing is not.
+3. Vendor a transformers reference for the norms, MLP, router and MLA the way
+   `indexer_refs.py` already does, and **drive inputs hard enough to exercise
+   clamps and saturation** or the tests inherit the blindness they remove.
+4. Row 28's assertion.
+5. Audit `LinearAttention` wiring, `DecoderLayer`, `FlashTextModel`.

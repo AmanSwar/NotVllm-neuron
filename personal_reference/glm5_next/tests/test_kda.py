@@ -324,3 +324,106 @@ def test_output_gate_eps_is_rms_norm_eps_not_1e_6():
     a = _hf_rmsnorm_gated(x, gate, w, 1e-5)
     b = _hf_rmsnorm_gated(x, gate, w, 1e-6)
     assert (a - b).abs().max() > 1e-3
+
+
+# ======================================== GDN vs KDA: the kernel adaptation's premise
+# The KDA NKI kernel is adapted from nkilib's GDN kernels on the premise that GDN is
+# KDA with a per-head SCALAR gate. Everything in that port rests on it, so it is tested
+# here rather than inherited from the prior art's header -- which has already proved too
+# narrow once (it missed silu-vs-sigmoid and eps 1e-6-vs-1e-5 in the same kernel).
+#
+# These are CROSS-REFERENCE tests against nkilib's own shipped reference, not
+# self-consistency tests. See tests/gdn_refs.py for provenance.
+
+import os  # noqa: E402
+
+from gdn_refs import gdn_cte_torch_nki_ref  # noqa: E402
+
+GDN_D = 128          # head_dim; gdn_cte_torch takes one head per call, so H == 1 here
+
+
+def _gdn_inputs(B=2, S=128, D=GDN_D, seed=0):
+    g_ = torch.Generator().manual_seed(seed)
+    r = lambda *s: torch.randn(*s, generator=g_)
+    q, k, v = r(B, S, D), r(B, S, D), r(B, S, D)
+    beta = torch.sigmoid(r(B, S))
+    gate = -5.0 * torch.sigmoid(r(B, S))        # per-token SCALAR log-decay, GDN-shaped
+    return q, k, v, beta, gate
+
+
+def _oracle_recurrent_1head(q, k, v, g_full, beta):
+    """Drive the oracle's recurrent_kda over S tokens with H == 1, from a zero state."""
+    B, S, D = q.shape
+    st = torch.zeros(B, 1, D, D)
+    outs = []
+    for t in range(S):
+        o, st = R.recurrent_kda(q[:, t:t + 1, None], k[:, t:t + 1, None], v[:, t:t + 1, None],
+                                g_full[:, t:t + 1], beta[:, t:t + 1, None], st)
+        outs.append(o)
+    return torch.cat(outs, 1)[:, :, 0], st[:, 0]
+
+
+def test_gdn_reference_is_bit_identical_to_kda_with_a_scalar_gate():
+    """THE PREMISE. With the gate constant along the channel axis, nkilib's GDN
+    reference and the oracle's recurrent_kda are the same fp32 computation.
+
+    Bit-exact, not merely close: the two perform the same operations in the same order.
+    That is what licenses adapting the GDN kernels at all, and it localises the port's
+    risk to the gate plus the surrounding folds.
+    """
+    q, k, v, beta, gate = _gdn_inputs()
+    # gdn_cte takes PRE-l2normed q,k and applies only `scale`; recurrent_kda l2norms itself.
+    o_gdn, s_gdn = gdn_cte_torch_nki_ref(R.l2norm(q), R.l2norm(k), v, beta, gate,
+                                         scale=GDN_D ** -0.5)
+    g_scalar = gate[:, :, None, None].expand(-1, -1, 1, GDN_D).contiguous()
+    o_orc, s_orc = _oracle_recurrent_1head(q, k, v, g_scalar, beta)
+    assert o_gdn.abs().max() > 1e-3, "output is ~zero; the comparison would be vacuous"
+    assert torch.equal(o_gdn, o_orc), f"out differs by {(o_gdn - o_orc).abs().max():.3e}"
+    assert torch.equal(s_gdn, s_orc), f"state differs by {(s_gdn - s_orc).abs().max():.3e}"
+
+
+def test_gdn_reference_matches_the_chunked_path_too():
+    """Same premise against chunk_kda, which is what the prefill kernel must reproduce.
+    Chunking is not bit-exact -- it reassociates -- so this is a tolerance test.
+    """
+    q, k, v, beta, gate = _gdn_inputs(seed=1)
+    o_gdn, s_gdn = gdn_cte_torch_nki_ref(R.l2norm(q), R.l2norm(k), v, beta, gate,
+                                         scale=GDN_D ** -0.5)
+    g_scalar = gate[:, :, None, None].expand(-1, -1, 1, GDN_D).contiguous()
+    o_chk, s_chk = R.chunk_kda(q[:, :, None], k[:, :, None], v[:, :, None],
+                               g_scalar, beta[:, :, None], torch.zeros(q.shape[0], 1, GDN_D, GDN_D),
+                               chunk=64)
+    assert (o_gdn - o_chk[:, :, 0]).abs().max() < 1e-6
+    assert (s_gdn - s_chk[:, 0]).abs().max() < 1e-5
+
+
+def test_a_per_channel_gate_does_not_match_gdn():
+    """THE DISCRIMINATING DIRECTION. A real KDA gate must NOT reproduce the GDN
+    reference -- otherwise the whole per-channel adaptation would be unnecessary and
+    this suite could not tell the two apart.
+    """
+    q, k, v, beta, gate = _gdn_inputs(seed=2)
+    o_gdn, _ = gdn_cte_torch_nki_ref(R.l2norm(q), R.l2norm(k), v, beta, gate,
+                                     scale=GDN_D ** -0.5)
+    g_chan = -5.0 * torch.sigmoid(torch.randn(q.shape[0], q.shape[1], 1, GDN_D,
+                                              generator=torch.Generator().manual_seed(7)))
+    o_pc, _ = _oracle_recurrent_1head(q, k, v, g_chan, beta)
+    rel = (o_gdn - o_pc).abs().max() / o_gdn.abs().max()
+    print(f"\n  per-channel gate vs GDN reference: {rel:.3f} relative")
+    assert rel > 0.05, f"per-channel gate only moves the output {rel:.4f} relative"
+
+
+@pytest.mark.skipif(not os.environ.get("NKILIB_SRC"),
+                    reason="set NKILIB_SRC to <nki-library>/src/nkilib_src to diff the vendored copy")
+def test_vendored_gdn_reference_still_matches_the_live_checkout():
+    """Drift guard: the vendored copy must still agree with nkilib's live file."""
+    import importlib.util
+    import pathlib as _pl
+    src = _pl.Path(os.environ["NKILIB_SRC"]) / "nkilib/experimental/gdn/gdn_cte_torch.py"
+    spec = importlib.util.spec_from_file_location("_live_gdn_cte_torch", src)
+    live = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(live)
+    q, k, v, beta, gate = _gdn_inputs(seed=3)
+    a = gdn_cte_torch_nki_ref(q, k, v, beta, gate, scale=GDN_D ** -0.5)
+    b = live.gdn_cte_torch_nki_ref(q, k, v, beta, gate, scale=GDN_D ** -0.5)
+    assert torch.equal(a[0], b[0]) and torch.equal(a[1], b[1])

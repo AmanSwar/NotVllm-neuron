@@ -42,9 +42,12 @@ What this file establishes:
 
 Hidden size and ``q_lora_rank`` are shrunk in the real-geometry tests. They only
 size the input projections; nothing about selection depends on them.
-Parameters are randomised at scales where the gate softmax is far from uniform.
-The real checkpoint's scales are [unverified], so a mean-pool mutant's margin
-here is not a statement about the real weights.
+Parameters are randomised at scales where the gate softmax is far from uniform
+(gate scores ~N(0, 4)). The real checkpoint is milder: gate-score std ~0.23-0.27
+and the largest pool slot weight has a median of ~0.33, against 0.25 for a plain
+mean. Even so, a mean-pool indexer on the real weights of layers 3/23/43 still
+changes the selection on 99-100% of lossy rows at S=3003 (pool overlap ~0.956).
+That is measured in dev/progress, not here.
 """
 from __future__ import annotations
 

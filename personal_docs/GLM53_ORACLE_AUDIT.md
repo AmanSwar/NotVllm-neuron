@@ -125,6 +125,37 @@ Rows 32, 33, 38 and 39 are the ones worth noting: each is an ordering or
 input-selection choice that would produce plausible, wrong output if reversed, and
 none of them has a test.
 
+### Dispatch and residual placement (second pass, re-verified 2026-09-25)
+
+Re-checked against `glm53-indexer` **after** dev2's clamp fix, since the file had
+moved (644 → 693 lines). `DecoderLayer.forward`, `LinearAttention` and
+`FlashTextModel` are byte-unchanged; only the `swiglu_limit` threading differs, so
+rows 30–39 stand. Three further rows, prompted by master:
+
+| # | Constant / choice | Oracle | Authority | agrees? | test? |
+|---|---|---|---|---|---|
+| 40 | attention dispatch | `cfg.layer_types[i]` → `LinearAttention` / `SparseMLAttention` | tf `config.layer_types[layer_idx]` (:1265) | ✓ | **no — nothing asserts it anywhere** |
+| 41 | MLP dispatch | `cfg.mlp_layer_types[i]` → `MoE` / `MLP` | tf `config.mlp_layer_types[layer_idx]` (:1274) | ✓ | **partial — and a left shift passes** |
+| 42 | shared-expert placement | `routed_sum + shared_experts(x)`, shared **not** routing-weighted, applied to the layer input | tf `experts(...) + shared_experts(residuals)`, `residuals` captured pre-flatten | ✓ | **no — `MoE.forward` has no external comparison** |
+
+**Row 40** is the larger gap. Across the whole suite there is no assertion that any
+layer picks the right *attention* kind. Inverting the dispatch, or shifting
+`layer_types` by one, would produce a model that runs, trains nothing, and fails
+nothing.
+
+**Row 41 is covered only partially, and the gap is demonstrable.**
+`test_both_mlp_call_sites_carry_the_limit` pins indices 0 (dense) and 3 (MoE).
+With `mlp_layer_types = [dense, dense, dense, sparse, sparse, …]`, shifting the
+list **left** by one gives index 0 → dense and index 3 → sparse: **both
+assertions still pass**. Two sampled indices cannot pin a pattern; an
+index-for-index comparison against the config can.
+
+**Row 42:** the MoE tests added with the clamp fix check the *limits* carried by
+`MLP` and by the routed path; they do not compare `MoE.forward`'s output to
+anything external. So the add position, and the fact that the shared expert is
+**not** multiplied by the routing weight, are unverified by test — though both
+match transformers on inspection.
+
 **Basis of this audit:** every row is a *source diff* against
 `modeling_glm5_next.py` and the live config, not a numerical comparison. The
 `agrees?` column says what the code says; the `test?` column says whether anything
@@ -193,7 +224,8 @@ Sorted by provenance, the diagnostic holds exactly:
   indexer — cross-checked, none wrong.
 - **Inherited verbatim from the NxDI port**: 1 confirmed bug (row 5), 1 found here
   (row 24), 3 divergences (rows 3, 7, 21), 1 unguarded assumption (row 28), and
-  **28 of 39 rows with no test that could disagree**.
+  **30 of 42 rows with no test that could disagree**, including the
+  attention-kind dispatch, which nothing asserts at all.
 
 `reference.py` says *"The math is unchanged from that CPU-verified version"*.
 "CPU-verified" in the NxDI fork meant its own tests passed — not that it had been

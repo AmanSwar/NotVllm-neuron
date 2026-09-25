@@ -33,14 +33,29 @@ per-head **scalar** ``exp(g)``; KDA scales each K row by its **own** ``exp(g[k])
 is substituted — the two agree closely enough on short, fast-decaying sequences
 that a weak test cannot tell them apart.
 
-Scope: text decoder only. Sparse-MLA layers run DENSE causal attention (no indexer),
-which is claimed to be mathematically identical to the DSA path for
-seq_len <= index_topk (2048): get_pooled_states() forms ceil(S/4) pools and
-select_k = min(2048//4, n_pools) selects all of them, then append_visible_tail()
-adds the incomplete last pool. Every causally visible token is therefore selected
--> full causal mask. **[unverified]** That argument is inherited from the NxDI
-README and has not been checked against the transformers indexer implementation;
-it is load-bearing for the dense-first plan, so it needs its own test.
+Scope and validity ceiling
+--------------------------
+Text decoder only. The 11 sparse-MLA layers run DENSE causal attention with no
+indexer, which is **exact for seq_len <= 2048 and wrong above it** — not
+approximate above it: the oracle attends to tokens the model's indexer excludes.
+
+Verified 2026-09-25 against vLLM's implementation, not by re-deriving the pool
+arithmetic. The question that mattered was whether ``index_kpool_compress`` means
+attention runs over compressed pool representatives (which would make selecting
+every pool still lossy). It does not: vLLM keeps the compressed entries in a
+separate ``Glm5NextIndexerCache`` used only for scoring, keeps the in-progress
+pool's **raw** K in ``Glm5NextTailCache``, and has attention gather full-fidelity
+tokens by the token indices the indexer emits. vLLM then takes this very shortcut
+itself — "Short sequences select every pool, so skip sparse scoring and fill the
+top-k buffer with all causal token indices" for prefill, and
+``_fill_short_decode_causal_indices`` for decode — both gated on
+``seq_len <= topk_tokens`` where ``topk_tokens = config.index_topk = 2048``.
+
+``tests/test_dense_mla_exactness.py`` pins the five things this depends on, so a
+config change trips a test rather than silently invalidating the oracle.
+
+**Milestone 2 targets 1M context; this oracle reaches 2048.** Validating anything
+longer needs a real indexer here.
 """
 from __future__ import annotations
 import math

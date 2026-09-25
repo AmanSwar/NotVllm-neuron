@@ -212,3 +212,115 @@ def test_conv_state_round_trips():
     with torch.no_grad():
         _, (cs3, _) = la(torch.randn(1, 9, cfg.hidden_size))
     assert cs3 is not None and cs3.shape[-1] == kernel
+
+
+# ============================================================ the output gate (o_norm)
+# The gate on RMSNormGated is SIGMOID, not silu/swish, and there is no config key for it.
+# The oracle read silu until 2026-09-25 -- carried over from Qwen3.8-27B, where
+# ``output_gate_type: "swish"`` genuinely is silu. Nothing caught it, because nothing
+# compared o_norm against an external reference and the only test that ran through it
+# (``test_layer_prefill_matches_step_decode``) compares the layer with ITSELF, which a
+# wrong activation satisfies exactly.
+#
+# Both formulas below are vendored with provenance, as tests/indexer_refs.py does.
+
+def _hf_rmsnorm_gated(x, gate, weight, eps):
+    """transformers 5.17 ``Glm5NextTextRMSNormGated.forward``, verbatim apart from
+    taking ``weight``/``eps`` as arguments and ACT2FN["sigmoid"] spelled out."""
+    input_dtype = x.dtype
+    hidden_states = x.to(torch.float32)
+    variance = hidden_states.pow(2).mean(-1, keepdim=True)
+    hidden_states = hidden_states * torch.rsqrt(variance + eps)
+    hidden_states = weight.to(torch.float32) * hidden_states
+    hidden_states = hidden_states * torch.sigmoid(gate.to(torch.float32))
+    return hidden_states.to(input_dtype)
+
+
+def _fla_gate(y, g, activation):
+    """vLLM ``third_party/flash_linear_attention/ops/kda.py`` lines 233-236, verbatim:
+
+        if ACTIVATION == "swish" or ACTIVATION == "silu":  b_y = b_y * b_g * sigmoid(b_g)
+        elif ACTIVATION == "sigmoid":                      b_y = b_y * sigmoid(b_g)
+    """
+    if activation in ("swish", "silu"):
+        return y * g * torch.sigmoid(g)
+    if activation == "sigmoid":
+        return y * torch.sigmoid(g)
+    raise ValueError(activation)
+
+
+def _gated_inputs(seed=0, H=8, dim=128):
+    g_ = torch.Generator().manual_seed(seed)
+    x = torch.randn(2, H, dim, generator=g_)
+    gate = torch.randn(2, H, dim, generator=g_)
+    return x, gate
+
+
+def test_output_gate_matches_transformers_exactly():
+    """Oracle o_norm == transformers Glm5NextTextRMSNormGated, to fp32 rounding."""
+    cfg = R.FlashCfg()
+    n = R.RMSNormGated(cfg.linear_head_dim, cfg.rms_norm_eps)
+    with torch.no_grad():
+        n.weight.normal_(1.0, 0.2)
+    x, gate = _gated_inputs()
+    with torch.no_grad():
+        got = n(x, gate)
+    want = _hf_rmsnorm_gated(x, gate, n.weight, cfg.rms_norm_eps)
+    torch.testing.assert_close(got, want, rtol=0, atol=1e-6)
+
+
+def test_output_gate_matches_vllm_sigmoid_branch():
+    """Same, against FLA's explicit ``activation="sigmoid"`` branch (vLLM kda.py:291)."""
+    cfg = R.FlashCfg()
+    n = R.RMSNormGated(cfg.linear_head_dim, cfg.rms_norm_eps)
+    with torch.no_grad():
+        n.weight.normal_(1.0, 0.2)
+    x, gate = _gated_inputs(seed=1)
+    xf = x.float()
+    base = xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + cfg.rms_norm_eps) * n.weight.float()
+    with torch.no_grad():
+        got = n(x, gate)
+    torch.testing.assert_close(got, _fla_gate(base, gate.float(), "sigmoid"), rtol=0, atol=1e-6)
+
+
+def test_output_gate_is_sigmoid_not_swish():
+    """THE DISCRIMINATING TEST. swish/silu is the wrong branch here, and it is the
+    branch a port lands on by accident: it is FLA's DEFAULT (``activation: str =
+    "swish"``), and it is correct for the sibling model Qwen3.8-27B. So a port that
+    instantiates FusedRMSNormGated without passing activation= gets this wrong silently.
+
+    The two differ by a factor of ``gate``, so this is not a tolerance question.
+    """
+    cfg = R.FlashCfg()
+    n = R.RMSNormGated(cfg.linear_head_dim, cfg.rms_norm_eps)
+    x, gate = _gated_inputs(seed=2)
+    xf = x.float()
+    base = xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + cfg.rms_norm_eps) * n.weight.float()
+    with torch.no_grad():
+        got = n(x, gate)
+    swish = _fla_gate(base, gate.float(), "swish")
+    rel = (got - swish).abs().max() / got.abs().max()
+    cos = torch.nn.functional.cosine_similarity(got.flatten(), swish.flatten(), 0)
+    print(f"\n  o_norm sigmoid vs swish: relative {rel:.3f}, cosine {cos:.4f}")
+    assert rel > 1.0, f"swish substitution only moves the output by {rel:.3f} relative"
+    assert cos < 0.9, f"swish substitution is {cos:.4f}-aligned with sigmoid; test is weak"
+    # and silu is spelled two ways in FLA -- both must be the same wrong branch
+    torch.testing.assert_close(swish, _fla_gate(base, gate.float(), "silu"), rtol=0, atol=0)
+
+
+def test_output_gate_eps_is_rms_norm_eps_not_1e_6():
+    """transformers passes ``eps=self.layer_norm_epsilon`` (= rms_norm_eps = 1e-5).
+    nkilib's gdn_tkg hardcodes 1e-6 in its RMSNormGated fold, so a KDA kernel adapted
+    from it must carry 1e-5 across or it is wrong by a small but systematic amount.
+    """
+    cfg = R.FlashCfg()
+    assert cfg.rms_norm_eps == 1e-5
+    la = R.LinearAttention(cfg)
+    assert la.o_norm.eps == cfg.rms_norm_eps
+    # non-vacuous: at small activations the two epsilons genuinely differ
+    x = torch.full((1, 1, cfg.linear_head_dim), 1e-3)
+    gate = torch.zeros(1, 1, cfg.linear_head_dim)
+    w = torch.ones(cfg.linear_head_dim)
+    a = _hf_rmsnorm_gated(x, gate, w, 1e-5)
+    b = _hf_rmsnorm_gated(x, gate, w, 1e-6)
+    assert (a - b).abs().max() > 1e-3

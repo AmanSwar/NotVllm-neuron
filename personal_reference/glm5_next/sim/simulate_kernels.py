@@ -20,6 +20,15 @@ What it checks, and why each one is here rather than being a nice-to-have:
 * **The scalar-gate trap.** Substituting GDN's per-head scalar gate must move the
   output far above that floor. This is the single most likely way to get KDA subtly
   wrong, and at fp32 it looks 260,000x easier to catch than it actually is.
+
+  The ratio is computed from **mean-abs**, not max-abs, and that is not cosmetic. A
+  max-abs ratio divides one extreme-value statistic by another: measured across input
+  draws it spans **2.2-4.4x** and *degrades with head count* (floor is a max over more
+  heads), reaching a minimum of **19.8 at BH=32** -- under the 20x threshold this
+  harness first used. The mean-abs ratio spans only **1.2-1.6x** with no head-count
+  trend and a minimum of 75.5 over the same draws. Quoting a single max-abs number as
+  though it were a property of the kernel is what produced two different "measurements"
+  (54.4x and 88.6x) of the same thing.
 * **The converse control.** With a genuinely scalar gate the kernel must still match
   the reference. A kernel that mangled the channel axis some other way would pass the
   trap alone.
@@ -105,9 +114,9 @@ def run_tkg():
 
     a_bad = list(a)
     a_bad[4] = a[4].mean(-1, keepdim=True).expand_as(a[4]).contiguous()
-    shift = (_tkg_run(*a_bad)[0] - got).abs().max().item()
-    check("scalar-gate trap (real gate)", shift / floor > 20,
-          f"{shift / floor:,.1f}x the floor")
+    ratio = ((_tkg_run(*a_bad)[0] - got).abs().mean().item()
+             / (got - ref).abs().mean().item())          # mean-abs: see the docstring
+    check("scalar-gate trap (real gate)", ratio > 20, f"{ratio:,.1f}x the floor (mean-abs)")
 
     for BH in (8, 6):                      # 6 exercises the LNC remainder branch
         a = _tkg_inputs(BH, seed=BH)
@@ -147,11 +156,11 @@ def run_cte():
 
     # the trap, and its converse
     got_pc, ref_pc, gate_pc = _cte_case(2, 128, seed=11)
-    floor = (got_pc - ref_pc).abs().max().item()
+    floor = (got_pc - ref_pc).abs().mean().item()
     gate_sc = gate_pc.mean(-1, keepdim=True).expand_as(gate_pc).contiguous()
     got_sc, ref_sc, _ = _cte_case(2, 128, seed=11, gate=gate_sc)
-    check("scalar-gate trap", (got_sc - got_pc).abs().max().item() / floor > 10,
-          f"{(got_sc - got_pc).abs().max().item() / floor:,.1f}x the floor")
+    ratio = (got_sc - got_pc).abs().mean().item() / floor
+    check("scalar-gate trap", ratio > 10, f"{ratio:,.1f}x the floor (mean-abs)")
     rel_sc = (got_sc - ref_sc).abs().max().item() / ref_sc.abs().max().item()
     check("still correct under a genuinely scalar gate", rel_sc < 0.015, f"{rel_sc:.3%}")
 

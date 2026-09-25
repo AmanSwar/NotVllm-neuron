@@ -564,11 +564,16 @@ class MLP(nn.Module):
     did not, which meant the dense FFN on layers 0-2 AND ``shared_experts`` on all 42
     MoE layers -- **45 of 45 layers** -- ran unclamped until 2026-09-25.
 
+    ``limit`` is REQUIRED, deliberately. It used to default to 10.0 -- which is the
+    real ``swiglu_limit``, so a call site that forgot to wire it was indistinguishable
+    from one that did. A required argument makes that failure impossible to construct
+    rather than merely detectable.
+
     It is invisible until activations reach the limit (see tests/test_mlp_moe.py):
     at gate/up std 1.0 nothing clamps at all, so a reference comparison on
     small-init weights passes with the bug present. Found by dev1's provenance audit.
     """
-    def __init__(self, D, I, limit=10.0):
+    def __init__(self, D, I, limit):
         super().__init__(); self.gate_proj = nn.Linear(D, I, bias=False); self.up_proj = nn.Linear(D, I, bias=False); self.down_proj = nn.Linear(I, D, bias=False)
         self.limit = limit
     def forward(self, x):

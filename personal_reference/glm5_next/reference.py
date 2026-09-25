@@ -523,9 +523,25 @@ class SparseMLAttention(nn.Module):
 
 # --------------------------------------------------------------------------------- MoE
 class MLP(nn.Module):
-    def __init__(self, D, I):
+    """Clamped SwiGLU: gate to (-inf, limit], up to [-limit, limit], THEN silu.
+
+    The clamp is not optional and not a numerical guard -- transformers calls it
+    "the key difference" (``Glm5NextTextMLP.forward``) and ``swiglu_limit`` is 10.0
+    in the live config. ``MoE``'s routed experts below have always had it; this class
+    did not, which meant the dense FFN on layers 0-2 AND ``shared_experts`` on all 42
+    MoE layers -- **45 of 45 layers** -- ran unclamped until 2026-09-25.
+
+    It is invisible until activations reach the limit (see tests/test_mlp_moe.py):
+    at gate/up std 1.0 nothing clamps at all, so a reference comparison on
+    small-init weights passes with the bug present. Found by dev1's provenance audit.
+    """
+    def __init__(self, D, I, limit=10.0):
         super().__init__(); self.gate_proj = nn.Linear(D, I, bias=False); self.up_proj = nn.Linear(D, I, bias=False); self.down_proj = nn.Linear(I, D, bias=False)
-    def forward(self, x): return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+        self.limit = limit
+    def forward(self, x):
+        g = self.gate_proj(x).clamp(max=self.limit)
+        u = self.up_proj(x).clamp(-self.limit, self.limit)
+        return self.down_proj(F.silu(g) * u)
 
 class TopkRouter(nn.Module):
     """sigmoid + e_score_correction_bias for CHOICE, raw sigmoid scores for WEIGHTS, norm to 1, x2.5. n_group=1 -> group logic is identity."""
@@ -549,7 +565,7 @@ class MoE(nn.Module):
         self.gate = TopkRouter(cfg); self.limit = cfg.swiglu_limit
         self.gate_up_proj = nn.Parameter(torch.randn(E, 2 * I, D) * 0.02)   # checkpoint: experts.N.{gate,up}_proj (separate)
         self.down_proj = nn.Parameter(torch.randn(E, D, I) * 0.02)          # checkpoint: experts.N.down_proj
-        self.shared_experts = MLP(D, I * cfg.n_shared_experts)
+        self.shared_experts = MLP(D, I * cfg.n_shared_experts, cfg.swiglu_limit)
     def forward(self, x):
         B, S, D = x.shape; flat = x.view(-1, D)
         w, idx = self.gate(flat)
@@ -568,7 +584,7 @@ class DecoderLayer(nn.Module):
         super().__init__()
         self.linear = cfg.layer_types[i] == "linear_attention"
         self.self_attn = LinearAttention(cfg) if self.linear else SparseMLAttention(cfg)
-        self.mlp = MoE(cfg) if cfg.mlp_layer_types[i] == "sparse" else MLP(cfg.hidden_size, cfg.intermediate_size)
+        self.mlp = MoE(cfg) if cfg.mlp_layer_types[i] == "sparse" else MLP(cfg.hidden_size, cfg.intermediate_size, cfg.swiglu_limit)
         self.input_layernorm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps); self.post_attention_layernorm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps)
         self.attn_hc = HyperConnection(cfg); self.ffn_hc = HyperConnection(cfg)   # checkpoint: hc_attn_*, hc_ffn_*
     def forward(self, streams, state=None):

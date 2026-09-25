@@ -5,6 +5,18 @@ dev1, 2026-09-25. Branch `oracle-provenance-audit` off `dev`.
 Audit only — **no fixes made here.** The oracle lives on `glm53-indexer`, which
 dev2 owns; this branch carries the finding, not the change.
 
+## Read this before the tables
+
+**Every row below is a source diff** against `transformers`
+`modeling_glm5_next.py` and the live config — **not a numerical comparison**. The
+`agrees?` column says what the code says. The `test?` column says whether anything
+in the suite would notice if it changed. Only rows where `test?` is yes are backed
+by something that runs.
+
+Without that distinction a reader takes 42 rows of "matches" as verification,
+which is precisely the trust-in-provenance error that produced three bugs on
+2026-09-25.
+
 ## Why this is a table of constants, not of components
 
 The KDA output-gate bug is the worked example, and it disqualifies component-level
@@ -54,7 +66,7 @@ reference — which happened for exactly two areas, KDA and the indexer.
 |---|---|---|---|---|---|
 | 1 | `rms_norm_eps` | `cfg.rms_norm_eps` = 1e-5 | config; tf same | ✓ | **no** |
 | 2 | RMSNorm scale form | plain `weight` | tf plain `weight` | ✓ | **no** — and this is a Qwen trap: Qwen3.5 uses `(1 + weight)` |
-| 3 | RMSNorm cast order | `(w · x_fp32).to(dt)` | tf `w * x.to(input_dtype)` | **✗** | **no** |
+| 3 | RMSNorm cast order | `(w · x_fp32).to(dt)` | tf `w * x.to(input_dtype)` | **✗ deliberate** | **yes** — dev2 pinned it with an fp64 arbiter: oracle 7.75e-03 vs tf 8.89e-03 in bf16, so ours is measurably the better reference |
 | 4 | `UnweightedRMSNorm` eps | `cfg.rms_norm_eps` | tf passes `config.rms_norm_eps` too | ✓ | **no** |
 | 5 | `RMSNormGated` activation | `sigmoid` | tf `self.activation = "sigmoid"` | ✓ **now** | **yes** (dev2, `b50f62d`) — was `silu` |
 | 6 | `o_norm` eps | `cfg.rms_norm_eps` | tf `layer_norm_epsilon` | ✓ | **no** |
@@ -134,8 +146,8 @@ rows 30–39 stand. Three further rows, prompted by master:
 
 | # | Constant / choice | Oracle | Authority | agrees? | test? |
 |---|---|---|---|---|---|
-| 40 | attention dispatch | `cfg.layer_types[i]` → `LinearAttention` / `SparseMLAttention` | tf `config.layer_types[layer_idx]` (:1265) | ✓ | **no — nothing asserts it anywhere** |
-| 41 | MLP dispatch | `cfg.mlp_layer_types[i]` → `MoE` / `MLP` | tf `config.mlp_layer_types[layer_idx]` (:1274) | ✓ | **partial — and a left shift passes** |
+| 40 | attention dispatch | `cfg.layer_types[i]` → `LinearAttention` / `SparseMLAttention` | tf `config.layer_types[layer_idx]` (:1265) | ✓ | **yes** — closed by `tests/test_layer_dispatch.py` (`6c1f661`) |
+| 41 | MLP dispatch | `cfg.mlp_layer_types[i]` → `MoE` / `MLP` | tf `config.mlp_layer_types[layer_idx]` (:1274) | ✓ | **yes** — upgraded from partial by the same file |
 | 42 | shared-expert placement | `routed_sum + shared_experts(x)`, shared **not** routing-weighted, applied to the layer input | tf `experts(...) + shared_experts(residuals)`, `residuals` captured pre-flatten | ✓ | **no — `MoE.forward` has no external comparison** |
 
 **Row 40** is the larger gap. Across the whole suite there is no assertion that any

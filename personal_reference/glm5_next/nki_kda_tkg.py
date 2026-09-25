@@ -1,9 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 """KDA (Kimi Delta Attention) single-token decode kernel for GLM-5.3-Flash.
 
-**STATUS: NOT YET RUN.** Written on a host with no NKI toolchain. Nothing below has
-been through ``nki.simulate``, let alone a device. Every claim about behaviour is a
-claim about the source it was adapted from, not a measurement of this file.
+**STATUS: RUNS UNDER ``nki.simulate``; NEVER RUN ON A DEVICE.** Simulated 2026-09-25
+on the x86 box (nki 0.6.0), BH in {2,4,6,8}, K=V=128, LNC 1 and 2. Results:
+
+* matches the fp32 oracle (``reference.recurrent_kda`` + ``RMSNormGated``) to
+  **0.53-0.66% relative**, which is the bf16 arithmetic floor -- see BF16 FLOOR below;
+* **LNC1 and LNC2 are byte-identical**, including the odd-BH remainder path (BH=6),
+  so the head sharding is sound;
+* the scalar-gate (GDN) substitution is caught at **54.4x** the floor.
+
+Simulation is not silicon: it does not exercise the real DMA engine, PSUM bank
+allocation, or SBUF capacity. The capacity envelope under CAPACITY below is still
+arithmetic, not a measurement.
 
 PROVENANCE
 ----------
@@ -69,13 +78,26 @@ KNOWN NUMERICAL NOTES
   computes ``x / sqrt(sum + eps)`` to match transformers. They differ by ~0.8 ULP
   (3e-8), which is ~4 orders of magnitude below the bf16 agreement floor below. Do not
   chase it; it is recorded so nobody mistakes it for a bug.
-* **The bf16 agreement floor is ~5e-4**, from emulating this kernel's cast points
-  against the fp32 oracle. That is the number any equivalence test must be built on.
-  The scalar-gate substitution -- the bug this kernel most needs to not have -- clears
-  that floor by only **11.8x** (long-decay) to **42.4x** (real gate), versus ~150,000x
-  in fp32. Use the REAL gate regime for that check; the polarity is opposite to the
-  chunk-vs-recurrent carry test. **[unverified]** -- emulation, not a measurement of
-  this kernel.
+BF16 FLOOR (measured under simulation)
+--------------------------------------
+The kernel agrees with the fp32 oracle to **0.53-0.66% relative**. That floor comes
+from **bf16 arithmetic throughout** -- ``S_bf`` is re-cast before each matmul,
+``delta_bf`` and ``k_f`` are bf16 -- and NOT primarily from the bf16 ``out`` buffer.
+Evidence: ``state_out`` is fp32 and carries a *comparable* floor (0.62% real,
+0.59% long), so dropping the output cast buys almost nothing. There is no cheap
+precision win available by validating on the state instead of the output.
+
+Consequences for any equivalence test against this kernel:
+
+* State it in **relative** terms. An absolute tolerance from the fp32 tests is
+  meaningless.
+* **The smallest detectable error is ~0.6% of the output.** A 5% perturbation of
+  ``v`` or of the incoming state moves the result only 3-8x the floor. Gross
+  structural errors are caught easily; subtle ones are not visible at this boundary.
+* **Use the REAL gate regime.** The scalar-gate substitution clears the floor by
+  **54.4x** there and only **4.2x** in the long-decay regime -- too thin to gate on.
+  The polarity is opposite to the chunk-vs-recurrent carry test, so the threshold
+  cannot be inherited from a neighbouring test.
 
 CAPACITY
 --------

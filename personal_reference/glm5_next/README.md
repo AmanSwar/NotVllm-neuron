@@ -79,6 +79,12 @@ The harness only needs this package's files, not the whole repo, so copying
   `dev/progress/2026-09-25-glm53-oracle-audit.md`.
 - **Both kernels** agree with the oracle to ~0.4–0.8% relative under simulation, which
   is the bf16 arithmetic floor, and both reject a per-head scalar gate.
+- **Treat the scalar-gate ratio as a distribution, not a measurement.** The harness
+  reports it from mean-abs, which spans ~1.2–1.6× across input draws. Earlier notes
+  quote 54.4× and 88.6× for the decode kernel; those are two *max-abs* samples of the
+  same quantity, and a max-abs ratio — one extreme-value statistic over another —
+  spans 2.2–4.4× and degrades with head count, down to 19.8× at BH=32. The numbers do
+  not contradict each other; the statistic was the wrong one.
 - **Neither kernel has run on a device.** Simulation does not exercise the real DMA
   engine, PSUM bank allocation or SBUF capacity, so the batch-vs-tensor-parallelism
   envelope in `nki_kda_tkg.py` is arithmetic, not measurement.

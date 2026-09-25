@@ -304,9 +304,17 @@ understates it in one direction and overstates it in another.
   `_can_use_kernel` requires `k_cache.dim() == 4` **and**
   `k_cache.shape == v_cache.shape` — *"Both caches must be the canonical 4D paged buffer
   of the same shape, so one row index serves both."* MLA has **one** latent cache.
-  Passing the same tensor as both arguments would issue two identical scatters and give
-  the aliasing pass two outputs aliasing one buffer, which is the exact hazard the
-  kernel was written to avoid. A single-tensor variant is the clean answer.
+
+  **Reconciliation with the tier-1 aliasing result (2026-09-25).** The shape guard is
+  *satisfiable* by aliasing: the tier-1 run confirmed that one latent tensor passed as
+  both K and V is accepted and bit-identical on the **read** side, and identical shapes
+  are exactly what `tp_k_prior=True` gives. So this is not a structural impossibility,
+  as an earlier draft of this section implied. It remains the wrong shape for the
+  **write** side: passing one buffer as both `k_cache` and `v_cache` would issue two
+  identical scatters (wasted DMA) and hand the FX aliasing pass two outputs aliasing one
+  buffer, which is the hazard the kernel exists to prevent. Reading may alias; writing
+  should not. A single-tensor variant is therefore still the clean answer, on
+  write-path grounds rather than shape grounds.
 - It also rejects FP8 caches (`dtype in (bf16, fp16, fp32)`, because "FP8 caches use a
   packed layout that needs read-modify-write"). Our latent cache is bf16, so this does
   not bind now, but it forecloses an FP8 latent cache later.
@@ -540,6 +548,15 @@ with a different index source.
   `use_dma_transpose` is False at `d_head > 128`, so the 512-wide path takes
   `nc_transpose` rather than the fast batched DMA transpose — a known slower route, not
   a wall, and unquantified.
+- **bf16 numerical adequacy: measured, and it is not a length problem.** The emulated
+  bf16 deviation from fp32 is **0.4-2% RMS, independent of context length** over a 256x
+  sweep (256 to 65,536); what governs it is attention peakedness (effective attended
+  count), not context. Worst observed 1.86e-2 rms-rel, 4.8x bf16 epsilon. The DSA
+  indexer's `index_topk = 2048` caps the governing quantity by construction, so 1M
+  context cannot amplify it. Full tables in
+  `dev/progress/2026-09-25-mla-decode-spike-prediction.md`. **Still open**: whether
+  0.4-2% RMS is acceptable end-to-end — a model-quality question for
+  `accuracy/logit_validation.py` against the HF oracle, not a kernel question.
 - **Whether `mla_common_cte`'s `L == 512 == P_MAX * 4` assumption is load-bearing
   anywhere a decode path would reach.** Only relevant if §5(b) happens.
 

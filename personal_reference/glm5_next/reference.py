@@ -357,6 +357,24 @@ def indices_to_mask(idx, L):
     safe = torch.where(idx < 0, L, idx)
     return torch.zeros(*idx.shape[:2], L + 1, dtype=torch.bool).scatter_(-1, safe, True)[..., :L]
 
+def injected_mask(idx, L):
+    """Mask from externally supplied token indices [B,S,W] (-1 = empty), e.g. a device's
+    captured topk_indices_buffer, for the query rows L-S .. L-1. Order and width are free.
+
+    Refuses what no correct indexer emits -- an index < -1 or >= L, a future token, a
+    duplicate -- because indices_to_mask would silently absorb it, and a device selection
+    bug would then show up as an unexplained attention mismatch. (vLLM never duplicates:
+    selected pools are distinct and lie below the tail.)"""
+    S = idx.shape[1]
+    if ((idx < -1) | (idx >= L)).any():
+        raise ValueError(f"injected index out of range [-1, {L})")
+    if ((idx >= 0) & (idx > torch.arange(L - S, L)[:, None])).any():
+        raise ValueError("injected indices select a future token")
+    srt = idx.sort(-1).values
+    if ((srt[..., 1:] == srt[..., :-1]) & (srt[..., 1:] >= 0)).any():
+        raise ValueError("injected indices contain a duplicate")
+    return indices_to_mask(idx, L)
+
 @dataclass
 class IndexerState:
     """Per-layer indexer cache: vLLM's two indexer caches, minus paging and FP8.
@@ -450,9 +468,15 @@ class SparseMLAttention(nn.Module):
         self.indexer = Indexer(cfg)
         self.dense = cfg.sparse_mla_dense
         self.scaling = self.qk ** -0.5
-    def forward(self, x, state=None):
+    def forward(self, x, state=None, topk_indices=None):
         """-> (out [B,S,D], (latent [B,L,kv_lora_rank], IndexerState | None)).
-        ``dense`` skips the indexer and attends causally to everything: exact only to seq 2051."""
+        ``dense`` skips the indexer and attends causally to everything: exact only to seq 2051.
+
+        ``topk_indices`` [B,S,W] (-1 = empty) replaces the indexer's selection for this call,
+        so attention can be checked against a device *given the device's own selection*.
+        FP8 scoring legitimately selects different pools (see module docstring), and without
+        this a real attention bug hides behind that divergence. The indexer still runs, so
+        the state advances exactly as it would have; only the mask changes."""
         B, S, _ = x.shape
         kv_cache, idx_state = state if state is not None else (None, None)
         q_c = self.q_a_layernorm(self.q_a_proj(x))                                           # also the indexer's q input
@@ -468,6 +492,9 @@ class SparseMLAttention(nn.Module):
             assert (idx_state.length if idx_state is not None else 0) == L - S, "indexer state out of step with the KV cache"
             idx, idx_state = self.indexer(x, q_c, idx_state)
             mask = indices_to_mask(idx, L).unsqueeze(1)                                   # [B,1,S,L]
+        if topk_indices is not None:
+            assert topk_indices.shape[:2] == (B, S), "topk_indices must be [B, S, W]"
+            mask = injected_mask(topk_indices.long(), L).unsqueeze(1)
         att = (q @ k.transpose(-1, -2)) * self.scaling
         att = att.masked_fill(~mask, float("-inf")).softmax(-1)
         return self.o_proj((att @ v).transpose(1, 2).reshape(B, S, -1)), (latent, idx_state)
